@@ -112,21 +112,24 @@ second-brain/
 
 ## Project Phases
 
-### Phase 1: Infrastructure ← CURRENT
+### Phase 1: Infrastructure ✓ COMPLETE
 - [x] Project structure and CLAUDE.md
 - [x] Slash commands for workflow (/judge, /security, /git-state)
-- [ ] Azure Blob Storage container for documents
-- [ ] Azure SQL Database (Basic tier)
-- [ ] Initialize SQL Graph schema (NODE/EDGE tables)
-- [ ] Azure Function App (Consumption plan)
-- [ ] Basic connectivity test
+- [x] Azure Resource Group (`rg-second-brain`)
+- [x] Azure Blob Storage account (`stsecondbrain`) + `documents` container
+- [x] Azure SQL Database (`secondbrain` on existing server)
+- [x] Azure Function App (`func-secondbrain`, Consumption plan)
+- [x] Managed identity: Function → Storage (Storage Blob Data Contributor)
+- [x] Managed identity: Function → SQL (db_datareader, db_datawriter)
 
-### Phase 2: Ingestion Pipeline (Azure Function)
+### Phase 2: Ingestion Pipeline (Azure Function) ← CURRENT
+- [ ] Initialize SQL Graph schema (NODE/EDGE tables)
 - [ ] Blob trigger function scaffold
 - [ ] PDF text extraction (PyMuPDF)
 - [ ] Markdown parsing
 - [ ] Chunking strategy (section/heading level)
 - [ ] Store sources + chunks in Azure SQL
+- [ ] Basic connectivity test
 
 ### Phase 3: Concept Extraction & Graph
 - [ ] Claude API integration for concept extraction
@@ -149,16 +152,26 @@ second-brain/
 
 ---
 
-## Current Phase: 1 - Infrastructure
+## Current Phase: 2 - Ingestion Pipeline
 
 ### Detailed Tasks
-1. Create Resource Group in Azure Portal
-2. Create Azure Blob Storage account + container for documents
-3. Create Azure SQL Database (Basic tier, ~$5/month)
-4. Initialize SQL Graph schema (sources, chunks, concepts as NODE tables)
-5. Create Azure Function App (Consumption plan)
-6. Configure environment variables in .env
-7. Run connectivity test
+1. Create SQL Graph schema (NODE/EDGE tables) via Azure Portal Query Editor
+2. Set up blob trigger function scaffold
+3. Implement PDF parsing with PyMuPDF
+4. Implement Markdown parsing
+5. Build chunking logic
+6. Write chunks to Azure SQL
+7. Test end-to-end with sample document
+
+### Azure Resources (Phase 1 Complete)
+
+| Resource | Name | Location |
+|----------|------|----------|
+| Resource Group | `rg-second-brain` | Central US |
+| Storage Account | `stsecondbrain` | Central US |
+| Blob Container | `documents` | - |
+| Function App | `func-secondbrain` | Central US |
+| SQL Database | `secondbrain` | Existing server (different RG) |
 
 ### Decisions Made
 - **Azure SQL over PostgreSQL**: SQL Graph provides native graph capabilities; no need for Apache AGE workarounds
@@ -167,11 +180,15 @@ second-brain/
 - **Generic sources schema**: Supports PDFs, markdown, and future document types via `source_type` field
 - **Option A folder structure**: Separated `functions/` (ingestion) from `app/` (interactive) with `shared/` for common code
 - **MVC for app**: The Streamlit app will follow models/views/controllers pattern
+- **Managed identity for auth**: No connection strings with passwords; Function App uses system-assigned managed identity
+- **Reuse existing SQL server**: Database created on existing SQL server in separate resource group
+- **Defer schema until Phase 2**: Create tables when ready to write data, not during infrastructure setup
 
 ### Architecture Rationale
 - **Why not PostgreSQL?** Azure PostgreSQL doesn't support Apache AGE extension
 - **Why not vector embeddings?** Claude can handle semantic search directly; simpler architecture, one less service
 - **Why SQL Graph?** Native to Azure SQL, uses familiar SQL + MATCH syntax, no separate graph database needed
+- **Why managed identity?** More secure than connection strings; automatic credential rotation; Azure-native
 
 ---
 
@@ -311,5 +328,6 @@ WHERE MATCH(c1-(related_to)->c2)
 |------|-------|---------|
 | 2025-12-30 | 1 | Initial architecture, Option A structure, slash commands |
 | 2025-12-31 | 1 | Architecture pivot: PostgreSQL → Azure SQL (for SQL Graph), removed pgvector/embeddings in favor of Claude API for search, added Azure Functions for ingestion, generalized schema from books to sources |
+| 2025-12-31 | 1→2 | Phase 1 complete. Azure resources created via Portal: Resource Group, Storage Account + container, Function App, SQL Database. Configured managed identity for Function → Storage and Function → SQL. Moved to Phase 2. |
 
 ---

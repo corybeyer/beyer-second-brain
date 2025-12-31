@@ -2,6 +2,8 @@
 
 Step-by-step instructions for setting up Second Brain infrastructure via the Azure Portal.
 
+**Status**: Phase 1 Complete
+
 ---
 
 ## Prerequisites
@@ -11,147 +13,166 @@ Step-by-step instructions for setting up Second Brain infrastructure via the Azu
 
 ---
 
+## Architecture Overview
+
+```
+Azure Blob Storage (documents)
+        ↓
+Azure Function (blob trigger)
+        ↓
+Azure SQL Database (SQL Graph)
+        ↓
+Claude API (search/synthesis)
+        ↓
+Streamlit App (Container Apps)
+```
+
+---
+
 ## Step 1: Create a Resource Group
 
 1. Go to **Azure Portal** → Search for "Resource groups"
 2. Click **+ Create**
 3. Fill in:
    - **Subscription**: Select your subscription
-   - **Resource group**: `rg-secondbrain`
-   - **Region**: Choose one close to you (e.g., `East US`)
+   - **Resource group**: `rg-second-brain`
+   - **Region**: Choose one (e.g., `Central US`)
 4. Click **Review + create** → **Create**
 
 ---
 
-## Step 2: Create Storage Account (for PDFs)
+## Step 2: Create Storage Account
 
 1. Search for "Storage accounts" → Click **+ Create**
 2. **Basics tab**:
-   - **Resource group**: `rg-secondbrain`
-   - **Storage account name**: `secondbrainbooks` (must be globally unique, add numbers if needed)
+   - **Resource group**: `rg-second-brain`
+   - **Storage account name**: `stsecondbrain` (must be globally unique)
    - **Region**: Same as resource group
    - **Performance**: Standard
    - **Redundancy**: LRS (Locally-redundant storage)
 3. **Advanced tab**:
-   - **Require secure transfer**: ✅ Enabled
-   - **Allow Blob anonymous access**: ❌ Disabled
+   - **Require secure transfer**: Enabled
+   - **Allow Blob anonymous access**: Disabled
 4. Click **Review + create** → **Create**
-5. Once created, go to the storage account:
-   - **Data storage** → **Containers** → **+ Container**
-   - Name: `books`
-   - Public access level: **Private**
-   - Click **Create**
 
-### Get Connection String
-1. In your storage account → **Security + networking** → **Access keys**
-2. Click **Show** next to key1
-3. Copy the **Connection string** - save this for your `.env` file
+### Create Container
+
+1. Go to the storage account
+2. **Data storage** → **Containers** → **+ Container**
+3. Name: `documents`
+4. Public access level: **Private**
+5. Click **Create**
 
 ---
 
-## Step 3: Create PostgreSQL Flexible Server
+## Step 3: Create Function App
 
-1. Search for "Azure Database for PostgreSQL flexible servers" → Click **+ Create**
+1. Search for "Function App" → Click **+ Create**
 2. **Basics tab**:
-   - **Resource group**: `rg-secondbrain`
-   - **Server name**: `secondbrain-pg` (add unique suffix if needed)
+   - **Resource group**: `rg-second-brain`
+   - **Function App name**: `func-secondbrain` (globally unique)
+   - **Runtime stack**: Python
+   - **Version**: 3.11
    - **Region**: Same as resource group
-   - **PostgreSQL version**: **16**
-   - **Workload type**: **Development** (cheapest option)
-   - **Compute + storage**: Click **Configure server**
-     - **Compute tier**: Burstable
-     - **Compute size**: Standard_B1ms (1 vCore, 2 GB RAM)
-     - **Storage**: 32 GB
-     - Click **Save**
-   - **Authentication method**: PostgreSQL authentication only
-   - **Admin username**: `sbadmin`
-   - **Password**: Create a strong password (save this!)
+   - **Operating System**: Linux
+   - **Hosting plan**: Consumption (Serverless)
+3. **Storage tab**:
+   - Use the storage account created above, or create new
+4. **Monitoring tab**:
+   - Enable Application Insights (recommended)
+5. Click **Review + create** → **Create**
+
+---
+
+## Step 4: Create SQL Database
+
+You can either:
+- **Option A**: Create a new SQL Server + Database
+- **Option B**: Use an existing SQL Server (create just a new database)
+
+### Option A: New SQL Server
+
+1. Search for "SQL databases" → Click **+ Create**
+2. **Basics tab**:
+   - **Resource group**: `rg-second-brain`
+   - **Database name**: `secondbrain`
+   - **Server**: Click "Create new"
+     - **Server name**: `sql-secondbrain` (globally unique)
+     - **Location**: Same region
+     - **Authentication**: SQL authentication
+     - **Admin login**: `sbadmin`
+     - **Password**: Create strong password (save this!)
+   - **Want to use SQL elastic pool?**: No
+   - **Workload environment**: Development
+   - **Compute + storage**: Click "Configure database"
+     - Select **Basic** tier (~$5/month)
 3. **Networking tab**:
-   - **Connectivity method**: Public access
-   - **Allow public access**: ✅ Yes
-   - **Firewall rules**:
-     - ✅ Add current client IP address
-     - ✅ Allow public access from any Azure service
+   - **Connectivity method**: Public endpoint
+   - **Allow Azure services**: Yes
+   - **Add current client IP**: Yes
 4. Click **Review + create** → **Create**
 
-⏳ This takes 5-10 minutes to deploy.
+### Option B: Existing SQL Server
+
+1. Go to your existing SQL Server
+2. Click **+ Create database**
+3. Name: `secondbrain`
+4. Compute: Basic tier (or share existing compute)
 
 ---
 
-## Step 4: Create the Database
+## Step 5: Configure Managed Identity
 
-1. Go to your PostgreSQL server
-2. **Settings** → **Databases** → **+ Add**
-3. Fill in:
-   - **Name**: `secondbrain`
-   - **Charset**: `UTF8`
-   - **Collation**: `en_US.utf8`
-4. Click **Save**
+### Enable on Function App (usually auto-enabled)
 
----
+1. Go to `func-secondbrain`
+2. **Settings** → **Identity**
+3. **System assigned** tab → Status: **On**
+4. Save
 
-## Step 5: Enable Extensions (pgvector + AGE)
+### Grant Storage Access
 
-1. Go to your PostgreSQL server
-2. **Settings** → **Server parameters**
-3. Search for `azure.extensions`
-4. In the value field, select:
-   - ✅ `VECTOR`
-   - ✅ `AGE`
-5. Click **Save**
-6. You may need to restart the server:
-   - **Overview** → **Restart**
+1. Go to `stsecondbrain` (Storage Account)
+2. **Access Control (IAM)** → **+ Add role assignment**
+3. Role: **Storage Blob Data Contributor**
+4. Members: Select "Managed identity" → `func-secondbrain`
+5. Click **Review + assign**
 
----
+### Grant SQL Access
 
-## Step 6: Get Connection Details
+1. Go to your SQL Server
+2. **Settings** → **Microsoft Entra ID**
+3. Click **Set admin** → Select yourself → Save
+4. Go to your database → **Query editor**
+5. Login with your Entra credentials
+6. Run:
 
-From your PostgreSQL server **Overview** page, note:
-- **Server name**: `<your-server>.postgres.database.azure.com`
-- **Admin username**: `sbadmin`
-- **Database**: `secondbrain`
-- **Port**: `5432`
-
----
-
-## Step 7: Update Your .env File
-
-Create a `.env` file from `.env.example`:
-
-```bash
-cp .env.example .env
-```
-
-Fill in your values:
-
-```env
-# Azure Storage
-AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=...
-AZURE_STORAGE_CONTAINER_NAME=books
-
-# Azure PostgreSQL
-POSTGRES_HOST=<your-server>.postgres.database.azure.com
-POSTGRES_PORT=5432
-POSTGRES_DB=secondbrain
-POSTGRES_USER=sbadmin
-POSTGRES_PASSWORD=<your-password>
-
-# OpenAI (for later phases)
-OPENAI_API_KEY=
-
-# Anthropic (optional, for later phases)
-ANTHROPIC_API_KEY=
+```sql
+CREATE USER [func-secondbrain] FROM EXTERNAL PROVIDER;
+ALTER ROLE db_datareader ADD MEMBER [func-secondbrain];
+ALTER ROLE db_datawriter ADD MEMBER [func-secondbrain];
 ```
 
 ---
 
-## Step 8: Test Connectivity
+## Step 6: Verify Setup
 
-Run the test script:
+### Resources Created
 
-```bash
-python scripts/test_connectivity.py
-```
+| Resource | Name | Location |
+|----------|------|----------|
+| Resource Group | `rg-second-brain` | Central US |
+| Storage Account | `stsecondbrain` | Central US |
+| Blob Container | `documents` | - |
+| Function App | `func-secondbrain` | Central US |
+| SQL Database | `secondbrain` | (your server) |
+
+### Connections
+
+| From | To | Method |
+|------|-----|--------|
+| Function App | Storage | Managed Identity (Storage Blob Data Contributor) |
+| Function App | SQL | Managed Identity (db_datareader, db_datawriter) |
 
 ---
 
@@ -159,30 +180,17 @@ python scripts/test_connectivity.py
 
 | Resource | SKU | Monthly Cost (approx) |
 |----------|-----|----------------------|
-| Storage Account | Standard LRS | ~$0.02/GB = ~$0.04 |
-| PostgreSQL | B1ms Burstable | ~$12-15 |
-| **Total** | | **~$15/month** |
-
-💡 **Tip**: Stop the PostgreSQL server when not in use to save costs.
-
----
-
-## Troubleshooting
-
-### Can't connect to PostgreSQL
-1. Check firewall rules include your current IP
-2. Verify the server is running (not stopped)
-3. Ensure you're using the full server name with `.postgres.database.azure.com`
-
-### Extensions not available
-1. Confirm extensions are enabled in Server parameters
-2. Restart the server after enabling
-3. Connect and run: `CREATE EXTENSION IF NOT EXISTS vector;`
+| Storage Account | Standard LRS | ~$0.50 |
+| Function App | Consumption | ~$0.00 (free tier) |
+| SQL Database | Basic | ~$5.00 |
+| **Total** | | **~$5-6/month** |
 
 ---
 
 ## Next Steps
 
-Once connectivity is verified:
-1. Run `python scripts/init_db.py` to create tables
-2. Proceed to Phase 2: Ingestion Pipeline
+1. Create SQL Graph schema (NODE/EDGE tables)
+2. Deploy blob trigger function
+3. Test document ingestion
+
+See [CLAUDE.md](../CLAUDE.md) for Phase 2 tasks.
