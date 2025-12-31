@@ -123,13 +123,14 @@ second-brain/
 - [x] Managed identity: Function → SQL (db_datareader, db_datawriter)
 
 ### Phase 2: Ingestion Pipeline (Azure Function) ← CURRENT
-- [ ] Initialize SQL Graph schema (NODE/EDGE tables)
-- [ ] Blob trigger function scaffold
+- [x] Align codebase with Azure SQL architecture (remove PostgreSQL code)
+- [x] Blob trigger function scaffold
 - [ ] PDF text extraction (PyMuPDF)
 - [ ] Markdown parsing
 - [ ] Chunking strategy (section/heading level)
+- [ ] Explore parsed document structure
+- [ ] Define SQL Graph schema based on parsing results
 - [ ] Store sources + chunks in Azure SQL
-- [ ] Basic connectivity test
 
 ### Phase 3: Concept Extraction & Graph
 - [ ] Claude API integration for concept extraction
@@ -155,13 +156,16 @@ second-brain/
 ## Current Phase: 2 - Ingestion Pipeline
 
 ### Detailed Tasks
-1. Create SQL Graph schema (NODE/EDGE tables) via Azure Portal Query Editor
-2. Set up blob trigger function scaffold
-3. Implement PDF parsing with PyMuPDF
-4. Implement Markdown parsing
-5. Build chunking logic
-6. Write chunks to Azure SQL
-7. Test end-to-end with sample document
+1. ~~Set up blob trigger function scaffold~~ ✓
+2. Implement PDF parsing with PyMuPDF
+3. Implement Markdown parsing
+4. Build chunking logic (heading-based + size-based)
+5. Explore parsed document structure with sample files
+6. Define SQL Graph schema based on actual parsing results
+7. Store sources + chunks in Azure SQL
+8. Test end-to-end with sample document
+
+**Approach**: Parse documents first, then design schema based on actual data structure needs.
 
 ### Azure Resources (Phase 1 Complete)
 
@@ -182,7 +186,7 @@ second-brain/
 - **MVC for app**: The Streamlit app will follow models/views/controllers pattern
 - **Managed identity for auth**: No connection strings with passwords; Function App uses system-assigned managed identity
 - **Reuse existing SQL server**: Database created on existing SQL server in separate resource group
-- **Defer schema until Phase 2**: Create tables when ready to write data, not during infrastructure setup
+- **Defer schema until after parsing**: Parse documents first to understand data structure, then design schema
 
 ### Architecture Rationale
 - **Why not PostgreSQL?** Azure PostgreSQL doesn't support Apache AGE extension
@@ -329,5 +333,6 @@ WHERE MATCH(c1-(related_to)->c2)
 | 2025-12-30 | 1 | Initial architecture, Option A structure, slash commands |
 | 2025-12-31 | 1 | Architecture pivot: PostgreSQL → Azure SQL (for SQL Graph), removed pgvector/embeddings in favor of Claude API for search, added Azure Functions for ingestion, generalized schema from books to sources |
 | 2025-12-31 | 1→2 | Phase 1 complete. Azure resources created via Portal: Resource Group, Storage Account + container, Function App, SQL Database. Configured managed identity for Function → Storage and Function → SQL. Moved to Phase 2. |
+| 2025-12-31 | 2 | Aligned codebase with Azure SQL architecture: rewrote db connection for pyodbc, removed PostgreSQL/pgvector/OpenAI code, restructured pipeline/ → functions/, created function scaffold with blob trigger, updated all scripts and dependencies. Schema deferred until after parsing exploration. |
 
 ---

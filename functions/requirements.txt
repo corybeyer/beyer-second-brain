@@ -1,0 +1,16 @@
+# Azure Functions dependencies
+azure-functions>=1.17.0
+azure-storage-blob>=12.19.0
+azure-identity>=1.15.0
+
+# Database
+pyodbc>=5.0.0
+
+# Document parsing
+pymupdf>=1.23.0
+
+# Claude API
+anthropic>=0.18.0
+
+# Utilities
+python-dotenv>=1.0.0
