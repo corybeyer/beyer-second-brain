@@ -29,9 +29,72 @@ pgvector    Apache AGE (graph)
 
 ---
 
+## File Structure (Option A: Split by Workload)
+
+```
+second-brain/
+├── CLAUDE.md              # This file - project context
+├── README.md
+├── pyproject.toml
+├── .env.example
+│
+├── .claude/
+│   ├── commands/          # Custom slash commands
+│   │   ├── judge.md       # /project:judge - code review
+│   │   ├── security.md    # /project:security - security check
+│   │   ├── git-state.md   # /project:git-state - git status
+│   │   └── phase-status.md
+│   └── settings.json      # Permissions and hooks
+│
+├── pipeline/              # BATCH PROCESSING (runs occasionally)
+│   ├── ingestion/         # PDF parsing, chunking
+│   │   ├── pdf_parser.py
+│   │   └── chunker.py
+│   ├── embeddings/        # Vector embedding generation
+│   │   └── embed.py
+│   └── graph/             # Concept extraction, graph building
+│       └── concept_extractor.py
+│
+├── app/                   # INTERACTIVE APP (MVC pattern)
+│   ├── models/            # Data classes, view models
+│   ├── views/             # Streamlit pages, UI components
+│   └── controllers/       # Search logic, orchestration
+│
+├── shared/                # COMMON CODE (used by both)
+│   ├── db/                # Database connection, schema
+│   │   ├── connection.py
+│   │   └── models.py
+│   └── config.py          # Environment, settings
+│
+├── scripts/               # One-off utilities, CLI tools
+│   ├── init_db.py
+│   └── test_connectivity.py
+│
+├── infrastructure/        # Azure setup
+│   ├── main.bicep
+│   ├── deploy.sh
+│   └── AZURE_PORTAL_SETUP.md
+│
+└── tests/
+```
+
+### Folder Rules
+
+| Folder | Contains | Pattern |
+|--------|----------|---------|
+| `pipeline/` | PDF parsing, embeddings, graph building | Batch ETL scripts |
+| `app/` | Streamlit UI, user-facing features | MVC (models/views/controllers) |
+| `shared/` | Database, config, utilities | Used by both pipeline and app |
+| `scripts/` | One-off tools, setup scripts | CLI utilities |
+| `infrastructure/` | Azure IaC, setup guides | DevOps |
+
+---
+
 ## Project Phases
 
-### Phase 1: Infrastructure
+### Phase 1: Infrastructure ← CURRENT
+- [x] Project structure and CLAUDE.md
+- [x] Slash commands for workflow (/judge, /security, /git-state)
 - [ ] Azure Blob Storage container for PDFs
 - [ ] Azure PostgreSQL Flexible Server (Burstable B1ms)
 - [ ] Enable pgvector extension
@@ -73,13 +136,44 @@ pgvector    Apache AGE (graph)
 ## Current Phase: 1 - Infrastructure
 
 ### Detailed Tasks
-_To be filled in as we begin this phase_
+1. Set up Azure resources via Portal (see infrastructure/AZURE_PORTAL_SETUP.md)
+2. Configure environment variables in .env
+3. Run connectivity test
+4. Initialize database schema
 
 ### Decisions Made
-_Document key choices here as we go_
+- **Option A folder structure**: Separated `pipeline/` (batch) from `app/` (interactive) with `shared/` for common code
+- **MVC for app**: The Streamlit app will follow models/views/controllers pattern
+- **Slash commands for review**: Using /judge and /security instead of automated hooks
 
 ### Open Questions
-_Parking lot for things to resolve_
+- Apache AGE availability on Azure PostgreSQL Flexible Server (may need workaround)
+
+---
+
+## Slash Commands
+
+| Command | Purpose |
+|---------|---------|
+| `/project:judge` | Review code for errors and correct folder placement |
+| `/project:security` | Security review (secrets, injection, dangerous patterns) |
+| `/project:git-state` | Check current git branch and status |
+| `/project:phase-status` | Show current phase progress and next steps |
+
+---
+
+## Commands
+
+```bash
+# Test Azure connectivity
+python scripts/test_connectivity.py
+
+# Initialize database schema
+python scripts/init_db.py
+
+# Run Streamlit app (Phase 5+)
+streamlit run app/views/main.py
+```
 
 ---
 
@@ -103,13 +197,10 @@ _Parking lot for things to resolve_
 ### PostgreSQL Tables
 
 ```sql
--- Core content
 books (id, title, author, file_path, uploaded_at)
 chunks (id, book_id, chapter, section, text, page_start, page_end, embedding vector(1536))
-
--- Graph handled via AGE, but conceptually:
--- Nodes: Book, Concept, Chunk
--- Edges: COVERS, MENTIONS, RELATED_TO (with weight)
+concepts (id, name, description, category)
+chunk_concepts (chunk_id, concept_id, relevance_score)
 ```
 
 ### Graph Schema (Apache AGE)
@@ -127,51 +218,15 @@ chunks (id, book_id, chapter, section, text, page_start, page_end, embedding vec
 
 ---
 
-## Commands
-
-```bash
-# TBD - will add as we build
-```
-
----
-
 ## Code Standards
 
 - Python 3.11+
-- Use `uv` or `pip` for dependencies
 - Type hints on all functions
 - Docstrings for public functions
 - Keep files under 300 lines
-- Environment variables for secrets (never commit)
-
----
-
-## File Structure
-
-```
-second-brain/
-├── CLAUDE.md
-├── README.md
-├── pyproject.toml
-├── .env.example
-├── infrastructure/
-│   └── (Bicep/Terraform for Azure resources)
-├── src/
-│   ├── ingestion/
-│   │   ├── pdf_parser.py
-│   │   └── chunker.py
-│   ├── embeddings/
-│   │   └── embed.py
-│   ├── graph/
-│   │   └── concept_extractor.py
-│   ├── db/
-│   │   └── models.py
-│   └── app/
-│       └── streamlit_app.py
-├── scripts/
-│   └── (one-off utilities)
-└── tests/
-```
+- Environment variables for secrets (never commit .env)
+- Run `/project:judge` after writing code
+- Run `/project:security` before committing
 
 ---
 
@@ -179,6 +234,6 @@ second-brain/
 
 | Date | Phase | Summary |
 |------|-------|---------|
-| _today_ | Planning | Initial architecture and CLAUDE.md created |
+| 2024-12-31 | 1 | Initial architecture, Option A structure, slash commands |
 
 ---
