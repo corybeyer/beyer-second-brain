@@ -2,29 +2,47 @@
 
 ## Objective
 
-Build a personal knowledge system that ingests PDF books on data team management, enables semantic search across the content, and surfaces relationships between concepts across different authors and books.
+Build a personal knowledge system that ingests documents (PDFs, markdown) on data team management, enables semantic search across the content, and surfaces relationships between concepts across different authors and sources.
 
-**Core question we want to answer**: "What do my books collectively say about topic X, and how do different authors' perspectives relate?"
+**Core question we want to answer**: "What do my sources collectively say about topic X, and how do different authors' perspectives relate?"
 
 ---
 
 ## Architecture Overview
 
 ```
-Azure Blob Storage (PDFs)
+Azure Blob Storage (PDFs, Markdown)
         ↓
-   PDF Parser + Chunker
+   Azure Function (Blob Trigger)
+        ↓
+   PDF Parser / MD Reader + Chunker
         ↓
    ┌────┴────┐
    ↓         ↓
-Embeddings  Concept Extraction
+Chunks      Concept Extraction (Claude API)
    ↓         ↓
-pgvector    Apache AGE (graph)
    └────┬────┘
         ↓
-   PostgreSQL (unified store)
+   Azure SQL Database
+   ├── Tables (sources, chunks)
+   └── SQL Graph (concepts, relationships)
+        ↓
+   Claude API (semantic search + synthesis)
         ↓
    Streamlit App (Azure Container Apps)
+```
+
+### Ingestion Workflow
+
+```
+1. UPLOAD      → PDF/MD lands in Azure Blob Storage
+2. TRIGGER     → Azure Function (Blob Trigger) fires
+3. PARSE       → Extract text from PDF (PyMuPDF) or read Markdown
+4. CHUNK       → Split into sections (by heading, chapter, or sliding window)
+5. STORE       → Insert source + chunks into Azure SQL
+6. EXTRACT     → Claude extracts concepts from each chunk
+7. BUILD GRAPH → Create nodes and edges in SQL Graph
+8. DONE        → Content searchable via app
 ```
 
 ---
@@ -46,21 +64,23 @@ second-brain/
 │   │   └── phase-status.md
 │   └── settings.json      # Permissions and hooks
 │
-├── pipeline/              # BATCH PROCESSING (runs occasionally)
-│   ├── ingestion/         # PDF parsing, chunking
-│   │   ├── pdf_parser.py
-│   │   └── chunker.py
-│   ├── embeddings/        # Vector embedding generation
-│   │   └── embed.py
-│   └── graph/             # Concept extraction, graph building
-│       └── concept_extractor.py
+├── functions/             # AZURE FUNCTIONS (blob triggers)
+│   ├── ingest_document/   # Triggered on blob upload
+│   │   ├── __init__.py
+│   │   └── function.json
+│   ├── shared/            # Shared code for functions
+│   │   ├── parser.py      # PDF/MD parsing
+│   │   ├── chunker.py     # Text chunking
+│   │   └── concepts.py    # Claude concept extraction
+│   ├── host.json
+│   └── requirements.txt
 │
 ├── app/                   # INTERACTIVE APP (MVC pattern)
 │   ├── models/            # Data classes, view models
 │   ├── views/             # Streamlit pages, UI components
 │   └── controllers/       # Search logic, orchestration
 │
-├── shared/                # COMMON CODE (used by both)
+├── shared/                # COMMON CODE (used by functions and app)
 │   ├── db/                # Database connection, schema
 │   │   ├── connection.py
 │   │   └── models.py
@@ -82,9 +102,9 @@ second-brain/
 
 | Folder | Contains | Pattern |
 |--------|----------|---------|
-| `pipeline/` | PDF parsing, embeddings, graph building | Batch ETL scripts |
+| `functions/` | Azure Functions for document ingestion | Blob-triggered processing |
 | `app/` | Streamlit UI, user-facing features | MVC (models/views/controllers) |
-| `shared/` | Database, config, utilities | Used by both pipeline and app |
+| `shared/` | Database, config, utilities | Used by both functions and app |
 | `scripts/` | One-off tools, setup scripts | CLI utilities |
 | `infrastructure/` | Azure IaC, setup guides | DevOps |
 
@@ -95,37 +115,33 @@ second-brain/
 ### Phase 1: Infrastructure ← CURRENT
 - [x] Project structure and CLAUDE.md
 - [x] Slash commands for workflow (/judge, /security, /git-state)
-- [ ] Azure Blob Storage container for PDFs
-- [ ] Azure PostgreSQL Flexible Server (Burstable B1ms)
-- [ ] Enable pgvector extension
-- [ ] Enable Apache AGE extension
+- [ ] Azure Blob Storage container for documents
+- [ ] Azure SQL Database (Basic tier)
+- [ ] Initialize SQL Graph schema (NODE/EDGE tables)
+- [ ] Azure Function App (Consumption plan)
 - [ ] Basic connectivity test
 
-### Phase 2: Ingestion Pipeline
+### Phase 2: Ingestion Pipeline (Azure Function)
+- [ ] Blob trigger function scaffold
 - [ ] PDF text extraction (PyMuPDF)
-- [ ] Chunking strategy (section/paragraph level)
-- [ ] Metadata extraction (title, author, chapter)
-- [ ] Store raw chunks in PostgreSQL
+- [ ] Markdown parsing
+- [ ] Chunking strategy (section/heading level)
+- [ ] Store sources + chunks in Azure SQL
 
-### Phase 3: Embeddings & Vector Search
-- [ ] OpenAI embedding integration (text-embedding-3-small)
-- [ ] Batch embed all chunks
-- [ ] pgvector index and similarity search
-- [ ] Test semantic queries
+### Phase 3: Concept Extraction & Graph
+- [ ] Claude API integration for concept extraction
+- [ ] Concept extraction prompt design
+- [ ] Upsert concepts to SQL Graph nodes
+- [ ] Build edges (covers, mentions, related_to)
+- [ ] Test graph queries with MATCH syntax
 
-### Phase 4: Concept Extraction & Graph
-- [ ] LLM-based concept extraction from chunks
-- [ ] Define graph schema (Book, Concept, Chunk nodes)
-- [ ] Build edges (COVERS, MENTIONS, RELATED_TO)
-- [ ] Graph queries (Cypher via AGE)
-
-### Phase 5: Streamlit Application
-- [ ] Search interface (semantic + keyword)
+### Phase 4: Streamlit Application
+- [ ] Search interface (Claude-powered semantic search)
 - [ ] Concept explorer (graph visualization)
-- [ ] Book comparison view
+- [ ] Source comparison view
 - [ ] Deploy to Azure Container Apps
 
-### Phase 6: Refinement (Future)
+### Phase 5: Refinement (Future)
 - [ ] Highlight extraction if feasible
 - [ ] Citation/quote extraction
 - [ ] Reading notes integration
@@ -136,18 +152,26 @@ second-brain/
 ## Current Phase: 1 - Infrastructure
 
 ### Detailed Tasks
-1. Set up Azure resources via Portal (see infrastructure/AZURE_PORTAL_SETUP.md)
-2. Configure environment variables in .env
-3. Run connectivity test
-4. Initialize database schema
+1. Create Resource Group in Azure Portal
+2. Create Azure Blob Storage account + container for documents
+3. Create Azure SQL Database (Basic tier, ~$5/month)
+4. Initialize SQL Graph schema (sources, chunks, concepts as NODE tables)
+5. Create Azure Function App (Consumption plan)
+6. Configure environment variables in .env
+7. Run connectivity test
 
 ### Decisions Made
-- **Option A folder structure**: Separated `pipeline/` (batch) from `app/` (interactive) with `shared/` for common code
+- **Azure SQL over PostgreSQL**: SQL Graph provides native graph capabilities; no need for Apache AGE workarounds
+- **Claude API for search**: Using Claude for semantic search and synthesis instead of vector embeddings (pgvector)
+- **Azure Functions for ingestion**: Blob trigger automatically processes new documents
+- **Generic sources schema**: Supports PDFs, markdown, and future document types via `source_type` field
+- **Option A folder structure**: Separated `functions/` (ingestion) from `app/` (interactive) with `shared/` for common code
 - **MVC for app**: The Streamlit app will follow models/views/controllers pattern
-- **Slash commands for review**: Using /judge and /security instead of automated hooks
 
-### Open Questions
-- Apache AGE availability on Azure PostgreSQL Flexible Server (may need workaround)
+### Architecture Rationale
+- **Why not PostgreSQL?** Azure PostgreSQL doesn't support Apache AGE extension
+- **Why not vector embeddings?** Claude can handle semantic search directly; simpler architecture, one less service
+- **Why SQL Graph?** Native to Azure SQL, uses familiar SQL + MATCH syntax, no separate graph database needed
 
 ---
 
@@ -182,38 +206,89 @@ streamlit run app/views/main.py
 | Layer | Technology | Notes |
 |-------|------------|-------|
 | Storage | Azure Blob Storage | Hot tier, ~2GB |
-| Database | Azure PostgreSQL Flexible | B1ms burstable |
-| Vector | pgvector extension | Cosine similarity |
-| Graph | Apache AGE extension | Cypher queries |
-| Embeddings | OpenAI text-embedding-3-small | ~$0.02/1M tokens |
-| Concept Extraction | Claude API or GPT-4o-mini | One-time batch |
+| Database | Azure SQL Database | Basic tier (~$5/month) |
+| Graph | SQL Graph (native) | NODE/EDGE tables, MATCH queries |
+| Ingestion | Azure Functions | Consumption plan, blob trigger |
+| Search & Synthesis | Claude API | Semantic search, concept extraction |
 | App | Streamlit | Python-native |
 | Hosting | Azure Container Apps | Free tier |
+
+### Estimated Monthly Cost
+| Service | Cost |
+|---------|------|
+| Azure Blob Storage | ~$0.50 |
+| Azure SQL Database (Basic) | ~$5.00 |
+| Azure Functions (Consumption) | ~$0.00 (free tier) |
+| Azure Container Apps | ~$0.00 (free tier) |
+| Claude API | Usage-based |
+| **Total Azure** | **~$5-6/month** |
 
 ---
 
 ## Data Model
 
-### PostgreSQL Tables
+### Node Tables (Azure SQL Graph)
 
 ```sql
-books (id, title, author, file_path, uploaded_at)
-chunks (id, book_id, chapter, section, text, page_start, page_end, embedding vector(1536))
-concepts (id, name, description, category)
-chunk_concepts (chunk_id, concept_id, relevance_score)
+-- Sources: PDFs, markdown files, articles, etc.
+CREATE TABLE sources (
+    id INT PRIMARY KEY IDENTITY,
+    title NVARCHAR(255),
+    source_type NVARCHAR(50),      -- 'book', 'markdown', 'article'
+    author NVARCHAR(255) NULL,
+    file_path NVARCHAR(500),
+    metadata NVARCHAR(MAX),        -- JSON for type-specific fields
+    created_at DATETIME2 DEFAULT GETDATE()
+) AS NODE;
+
+-- Chunks: text segments from sources
+CREATE TABLE chunks (
+    id INT PRIMARY KEY IDENTITY,
+    source_id INT,
+    section NVARCHAR(255),         -- chapter, heading, etc.
+    text NVARCHAR(MAX),
+    position INT,                  -- ordering within source
+    metadata NVARCHAR(MAX)         -- page numbers, line numbers, etc.
+) AS NODE;
+
+-- Concepts: extracted topics and ideas
+CREATE TABLE concepts (
+    id INT PRIMARY KEY IDENTITY,
+    name NVARCHAR(255),
+    description NVARCHAR(MAX),
+    category NVARCHAR(100)
+) AS NODE;
 ```
 
-### Graph Schema (Apache AGE)
+### Edge Tables
 
+```sql
+CREATE TABLE covers AS EDGE;      -- Source covers Concept (with weight)
+CREATE TABLE mentions AS EDGE;    -- Chunk mentions Concept (with relevance)
+CREATE TABLE related_to AS EDGE;  -- Concept related to Concept (with strength)
+CREATE TABLE from_source AS EDGE; -- Chunk from Source
 ```
-(:Book {id, title, author})
-(:Concept {id, name, description})
-(:Chunk {id, text_preview})
 
-(:Book)-[:COVERS {weight}]->(:Concept)
-(:Chunk)-[:MENTIONS]->(:Concept)
-(:Concept)-[:RELATED_TO {weight}]->(:Concept)
-(:Chunk)-[:FROM]->(:Book)
+### Example Graph Queries
+
+```sql
+-- Find all concepts covered by a source
+SELECT s.title, c.name
+FROM sources s, covers cov, concepts c
+WHERE MATCH(s-(covers)->c)
+  AND s.title = 'Data Mesh';
+
+-- Find concepts discussed by multiple authors
+SELECT c.name, s1.author, s2.author
+FROM sources s1, covers c1, concepts c, covers c2, sources s2
+WHERE MATCH(s1-(c1)->c<-(c2)-s2)
+  AND s1.author < s2.author;
+
+-- Find related concepts (2 hops from a starting concept)
+SELECT c1.name, c2.name, r.strength
+FROM concepts c1, related_to r, concepts c2
+WHERE MATCH(c1-(related_to)->c2)
+  AND c1.name = 'data product';
 ```
 
 ---
@@ -234,6 +309,7 @@ chunk_concepts (chunk_id, concept_id, relevance_score)
 
 | Date | Phase | Summary |
 |------|-------|---------|
-| 2024-12-31 | 1 | Initial architecture, Option A structure, slash commands |
+| 2025-12-30 | 1 | Initial architecture, Option A structure, slash commands |
+| 2025-12-31 | 1 | Architecture pivot: PostgreSQL → Azure SQL (for SQL Graph), removed pgvector/embeddings in favor of Claude API for search, added Azure Functions for ingestion, generalized schema from books to sources |
 
 ---
