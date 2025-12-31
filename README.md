@@ -1,4 +1,4 @@
-# Second Brain: Data Leadership Knowledge System
+# Second Brain
 
 A personal knowledge management system for surfacing insights and relationships across a library of data team management books.
 
