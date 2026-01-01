@@ -4,14 +4,9 @@ Stores extracted concepts and edges in Azure SQL Graph tables.
 Handles upserts, mentions edges, and relationship edges.
 """
 
-import sys
-from pathlib import Path
 from typing import TYPE_CHECKING
 
-# Add project root for shared imports
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-
-from shared.db.connection import get_db_cursor
+from .db.connection import get_db_cursor
 
 from .concepts import ExtractionResult, Relationship, find_source_relationships
 from .logging_utils import structured_logger

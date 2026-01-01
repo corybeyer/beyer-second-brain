@@ -6,13 +6,8 @@ Supports optional embeddings storage.
 """
 
 import json
-import sys
-from pathlib import Path
 
-# Add project root for shared imports
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-
-from shared.db.connection import get_db_cursor
+from .db.connection import get_db_cursor
 
 from .chunker import Chunk
 from .logging_utils import structured_logger
