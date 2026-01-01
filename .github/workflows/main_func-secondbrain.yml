@@ -33,13 +33,6 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Prepare deployment package
-        run: |
-          # Copy shared db module into functions/shared for deployment
-          # The functions/shared/ modules import from .db.connection
-          cp -r shared/db functions/shared/
-          cp shared/config.py functions/shared/
-
       - name: Install dependencies into package
         run: |
           # Azure Functions Python requires dependencies in .python_packages
