@@ -21,11 +21,15 @@ dependencies = [
     # Claude API
     "anthropic>=0.18.0",
 
+    # OpenAI (embeddings)
+    "openai>=1.12.0",
+
     # App
     "streamlit>=1.30.0",
 
     # Utilities
     "tqdm>=4.66.0",
+    "numpy>=1.24.0",
 ]
 
 [project.optional-dependencies]

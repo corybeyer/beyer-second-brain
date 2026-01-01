@@ -17,6 +17,8 @@ class Chunk:
     page_start: int | None = None
     page_end: int | None = None
     section: str | None = None  # Heading or section name if available
+    embedding: list[float] | None = None  # OpenAI embedding (1536 dims)
+    id: int | None = None  # Database ID (set after storage)
 
 
 def chunk_document(
