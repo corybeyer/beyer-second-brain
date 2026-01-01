@@ -47,6 +47,126 @@ Chunks      Concept Extraction (Claude API)
 
 ---
 
+## System Behavior
+
+This section defines how the system behaves under real conditions—failure modes, recovery patterns, and operational constraints.
+
+### Failure Modes
+
+| Step | Failure | Impact | Handling |
+|------|---------|--------|----------|
+| Blob Trigger | Function timeout (10 min max) | Large PDF unprocessed | Enforce size limits, log and skip |
+| PDF Parse | Corrupt/encrypted/scanned file | Ingestion fails | Mark source as `failed`, log reason |
+| Chunking | Text too sparse or malformed | Poor chunk quality | Validate minimum text length |
+| Claude API | Rate limit (429) or timeout | Concepts not extracted | Retry with exponential backoff |
+| Claude API | Context too large | Chunk rejected | Split oversized chunks before sending |
+| SQL Write | Connection drop mid-transaction | Partial data | Wrap in transaction, rollback on failure |
+| SQL Write | Duplicate key | Re-processing conflict | Use upsert patterns (MERGE) |
+
+### Processing States
+
+Track document lifecycle to enable recovery and prevent duplicate work:
+
+```
+UPLOADED → PARSING → PARSED → EXTRACTING → COMPLETE
+              ↓                    ↓
+           PARSE_FAILED      EXTRACT_FAILED
+```
+
+- Add `status` and `error_message` columns to sources table
+- Query by status to find stuck/failed documents
+- Enable manual retry of failed documents
+
+### Idempotency
+
+Same input must produce same result. Critical for retries and reprocessing:
+
+| Entity | Natural Key | Strategy |
+|--------|-------------|----------|
+| Source | `file_path` | Skip if exists, or delete-and-replace |
+| Chunk | `source_id` + `position` | Delete all chunks for source, re-insert |
+| Concept | `name` (case-insensitive) | Upsert (MERGE on name) |
+| Edges | `$from_id` + `$to_id` | Upsert or recreate with source |
+
+### Retry Patterns
+
+| Operation | Strategy | Max Retries | Backoff | Notes |
+|-----------|----------|-------------|---------|-------|
+| Claude API | Exponential | 3 | 2s, 4s, 8s | Respect `Retry-After` header |
+| SQL Connection | Exponential | 3 | 1s, 2s, 4s | Use connection pooling |
+| SQL Transaction | None | 0 | - | Fail fast, log for manual review |
+| Blob Read | Automatic | - | - | Azure handles trigger retries |
+
+### Cost Controls
+
+| Control | Limit | Rationale |
+|---------|-------|-----------|
+| Max PDF size | 100 MB | Function memory (1.5 GB) and timeout |
+| Max pages per PDF | 1000 | Reasonable book length |
+| Max chunks per source | 500 | Claude API cost per document |
+| Max chunk size | 4000 chars | Claude context efficiency |
+| Daily Claude API budget | $25 | Alert threshold, not hard stop |
+| Max concurrent extractions | 5 | Rate limit protection |
+
+### Observability
+
+**Logging** (structured JSON):
+```json
+{
+  "timestamp": "2025-01-01T12:00:00Z",
+  "level": "INFO",
+  "step": "parse",
+  "source_id": 42,
+  "file_path": "documents/data-mesh.pdf",
+  "duration_ms": 1523,
+  "chunks_created": 87
+}
+```
+
+**Key Metrics**:
+- Documents processed (success/failure by type)
+- Chunks created per source (avg, p95)
+- Concepts extracted per source
+- Claude API latency and token usage
+- Processing queue depth (pending sources)
+
+**Alerts** (future):
+- Function failure rate > 10%
+- Claude API error rate > 5%
+- Processing stuck (no progress in 1 hour)
+- Daily cost approaching budget
+
+### Invariants
+
+These must always be true. Violations indicate bugs:
+
+1. Every chunk belongs to exactly one source (`source_id` FK)
+2. Every source has a valid `status` (enum, not null)
+3. Concept names are unique (case-insensitive, enforced by unique index)
+4. No orphaned chunks (cascade delete when source deleted)
+5. No orphaned edges (cascade delete when node deleted)
+6. Chunk positions are sequential within a source (1, 2, 3...)
+7. Sources with `status = 'COMPLETE'` have at least one chunk
+
+### Boundaries & Contracts
+
+**Function Input Contract**:
+- Blob must be PDF or Markdown (validate by extension and magic bytes)
+- File size ≤ 100 MB
+- File path format: `documents/{filename}.{pdf|md}`
+
+**Function Output Contract**:
+- On success: source created with `status = 'PARSED'`, chunks inserted
+- On failure: source created with `status = 'PARSE_FAILED'`, `error_message` set
+- Idempotent: re-triggering same blob produces same end state
+
+**Claude API Contract**:
+- Input: chunk text ≤ 4000 chars
+- Output: JSON with `concepts` array, each with `name`, `description`, `category`
+- Timeout: 30 seconds per chunk
+
+---
+
 ## File Structure (Option A: Split by Workload)
 
 ```
@@ -202,6 +322,7 @@ second-brain/
 | `/project:security` | Security review (secrets, injection, dangerous patterns) |
 | `/project:git-state` | Check current git branch and status |
 | `/project:phase-status` | Show current phase progress and next steps |
+| `/project:systems-check` | Review code against system behavior patterns (retries, idempotency, error handling) |
 
 ---
 
@@ -321,6 +442,7 @@ WHERE MATCH(c1-(related_to)->c2)
 - Environment variables for secrets (never commit .env)
 - Run `/project:judge` after writing code
 - Run `/project:security` before committing
+- **Before committing**: Verify code against System Behavior patterns (failure modes, idempotency, retries, cost controls, observability). Report gaps to user before proceeding.
 
 ---
 
@@ -333,5 +455,6 @@ WHERE MATCH(c1-(related_to)->c2)
 | 2025-12-31 | 1→2 | Phase 1 complete. Azure resources created via Portal: Resource Group, Storage Account + container, Function App, SQL Database. Configured managed identity for Function → Storage and Function → SQL. Moved to Phase 2. |
 | 2025-12-31 | 2 | Aligned codebase with Azure SQL architecture: rewrote db connection for pyodbc, removed PostgreSQL/pgvector/OpenAI code, restructured pipeline/ → functions/, created function scaffold with blob trigger, updated all scripts and dependencies. Schema deferred until after parsing exploration. |
 | 2026-01-01 | 2 | Implemented PDF parsing (PyMuPDF) with metadata and heading extraction. Built chunking system (page-based with size fallback, sentence-aware breaks, overlap). Wired blob trigger to parse and chunk PDFs. Ready to test with sample document. |
+| 2026-01-01 | 2 | Added System Behavior section: failure modes, processing states, idempotency, retry patterns, cost controls, observability, invariants, and contracts. Created /project:systems-check command. |
 
 ---
