@@ -10,56 +10,59 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def test_postgres() -> bool:
-    """Test PostgreSQL connection."""
-    print("Testing PostgreSQL connection...")
+def test_azure_sql() -> bool:
+    """Test Azure SQL Database connection."""
+    print("Testing Azure SQL connection...")
 
     try:
-        import psycopg2
+        import pyodbc
 
-        conn = psycopg2.connect(
-            host=os.environ["POSTGRES_HOST"],
-            port=int(os.environ.get("POSTGRES_PORT", 5432)),
-            dbname=os.environ["POSTGRES_DB"],
-            user=os.environ["POSTGRES_USER"],
-            password=os.environ["POSTGRES_PASSWORD"],
-            sslmode="require",
+        server = os.environ["AZURE_SQL_SERVER"]
+        database = os.environ.get("AZURE_SQL_DATABASE", "secondbrain")
+        username = os.environ["AZURE_SQL_USERNAME"]
+        password = os.environ["AZURE_SQL_PASSWORD"]
+
+        conn_str = (
+            f"Driver={{ODBC Driver 18 for SQL Server}};"
+            f"Server=tcp:{server},1433;"
+            f"Database={database};"
+            f"Uid={username};"
+            f"Pwd={password};"
+            "Encrypt=yes;"
+            "TrustServerCertificate=no;"
         )
 
+        conn = pyodbc.connect(conn_str)
         cursor = conn.cursor()
 
         # Test basic query
-        cursor.execute("SELECT version();")
+        cursor.execute("SELECT @@VERSION;")
         version = cursor.fetchone()[0]
-        print(f"  ✓ Connected to PostgreSQL")
+        print("  + Connected to Azure SQL")
         print(f"    Version: {version[:60]}...")
 
-        # Test pgvector extension
-        cursor.execute("SELECT extname FROM pg_extension WHERE extname = 'vector';")
-        if cursor.fetchone():
-            print("  ✓ pgvector extension is enabled")
+        # Test SQL Graph support (it's built-in to Azure SQL)
+        cursor.execute("""
+            SELECT CASE
+                WHEN SERVERPROPERTY('EngineEdition') IN (5, 6, 8)
+                THEN 1 ELSE 0 END AS IsAzureSQL;
+        """)
+        is_azure = cursor.fetchone()[0]
+        if is_azure:
+            print("  + Azure SQL detected (SQL Graph supported)")
         else:
-            print("  ✗ pgvector extension NOT enabled")
-            print("    → Enable 'vector' in Azure Portal: Server parameters → azure.extensions")
-
-        # Test AGE extension
-        cursor.execute("SELECT extname FROM pg_extension WHERE extname = 'age';")
-        if cursor.fetchone():
-            print("  ✓ Apache AGE extension is enabled")
-        else:
-            print("  ✗ Apache AGE extension NOT enabled")
-            print("    → Enable 'age' in Azure Portal: Server parameters → azure.extensions")
+            print("  - Not Azure SQL, SQL Graph may not be available")
 
         cursor.close()
         conn.close()
         return True
 
     except KeyError as e:
-        print(f"  ✗ Missing environment variable: {e}")
-        print("    → Check your .env file")
+        print(f"  - Missing environment variable: {e}")
+        print("    Check your .env file")
         return False
     except Exception as e:
-        print(f"  ✗ Connection failed: {e}")
+        print(f"  - Connection failed: {e}")
         return False
 
 
@@ -71,36 +74,36 @@ def test_blob_storage() -> bool:
         from azure.storage.blob import BlobServiceClient
 
         connection_string = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
-        container_name = os.environ.get("AZURE_STORAGE_CONTAINER_NAME", "books")
+        container_name = os.environ.get("AZURE_STORAGE_CONTAINER_NAME", "documents")
 
         blob_service = BlobServiceClient.from_connection_string(connection_string)
 
         # List containers
         containers = list(blob_service.list_containers())
-        print(f"  ✓ Connected to Azure Blob Storage")
+        print("  + Connected to Azure Blob Storage")
         print(f"    Containers: {[c['name'] for c in containers]}")
 
-        # Check for books container
+        # Check for documents container
         container_names = [c["name"] for c in containers]
         if container_name in container_names:
-            print(f"  ✓ Container '{container_name}' exists")
+            print(f"  + Container '{container_name}' exists")
 
             # Count blobs
             container_client = blob_service.get_container_client(container_name)
             blobs = list(container_client.list_blobs())
             print(f"    Files: {len(blobs)}")
         else:
-            print(f"  ✗ Container '{container_name}' not found")
-            print(f"    → Create it in Azure Portal or update AZURE_STORAGE_CONTAINER_NAME")
+            print(f"  - Container '{container_name}' not found")
+            print(f"    Create it in Azure Portal or update AZURE_STORAGE_CONTAINER_NAME")
 
         return True
 
     except KeyError as e:
-        print(f"  ✗ Missing environment variable: {e}")
-        print("    → Check your .env file")
+        print(f"  - Missing environment variable: {e}")
+        print("    Check your .env file")
         return False
     except Exception as e:
-        print(f"  ✗ Connection failed: {e}")
+        print(f"  - Connection failed: {e}")
         return False
 
 
@@ -116,11 +119,11 @@ def main() -> None:
     # Check .env file exists
     env_path = Path(__file__).parent.parent / ".env"
     if not env_path.exists():
-        print("⚠ No .env file found")
-        print("  → Copy .env.example to .env and fill in your values")
+        print("! No .env file found")
+        print("  Copy .env.example to .env and fill in your values")
         print()
 
-    results.append(("PostgreSQL", test_postgres()))
+    results.append(("Azure SQL", test_azure_sql()))
     results.append(("Blob Storage", test_blob_storage()))
 
     print()
@@ -130,17 +133,17 @@ def main() -> None:
 
     all_passed = True
     for name, passed in results:
-        status = "✓ PASS" if passed else "✗ FAIL"
+        status = "+ PASS" if passed else "- FAIL"
         print(f"  {name}: {status}")
         if not passed:
             all_passed = False
 
     print()
     if all_passed:
-        print("All tests passed! Ready for Phase 2.")
+        print("All tests passed! Ready for document parsing.")
         print("\nNext steps:")
-        print("  1. Run: python scripts/init_db.py")
-        print("  2. Upload PDFs to blob storage")
+        print("  1. Upload documents to blob storage")
+        print("  2. Implement document parsing in functions/")
     else:
         print("Some tests failed. Check the errors above.")
         sys.exit(1)

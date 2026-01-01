@@ -10,7 +10,7 @@ load_dotenv()
 
 # Project paths
 PROJECT_ROOT = Path(__file__).parent.parent
-PIPELINE_DIR = PROJECT_ROOT / "pipeline"
+FUNCTIONS_DIR = PROJECT_ROOT / "functions"
 APP_DIR = PROJECT_ROOT / "app"
 SHARED_DIR = PROJECT_ROOT / "shared"
 
@@ -25,17 +25,14 @@ def get_env(key: str, default: str | None = None) -> str:
 
 # Azure Storage
 AZURE_STORAGE_CONNECTION_STRING = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "")
-AZURE_STORAGE_CONTAINER_NAME = os.environ.get("AZURE_STORAGE_CONTAINER_NAME", "books")
+AZURE_STORAGE_CONTAINER_NAME = os.environ.get("AZURE_STORAGE_CONTAINER_NAME", "documents")
 
-# PostgreSQL
-POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "")
-POSTGRES_PORT = int(os.environ.get("POSTGRES_PORT", "5432"))
-POSTGRES_DB = os.environ.get("POSTGRES_DB", "secondbrain")
-POSTGRES_USER = os.environ.get("POSTGRES_USER", "")
-POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "")
+# Azure SQL Database
+AZURE_SQL_SERVER = os.environ.get("AZURE_SQL_SERVER", "")
+AZURE_SQL_DATABASE = os.environ.get("AZURE_SQL_DATABASE", "secondbrain")
+AZURE_SQL_USERNAME = os.environ.get("AZURE_SQL_USERNAME", "")
+AZURE_SQL_PASSWORD = os.environ.get("AZURE_SQL_PASSWORD", "")
+AZURE_SQL_USE_MI = os.environ.get("AZURE_SQL_USE_MI", "false")  # Use managed identity
 
-# OpenAI
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-
-# Anthropic (optional)
+# Anthropic Claude API
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
