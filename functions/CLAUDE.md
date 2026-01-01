@@ -70,6 +70,11 @@ Defined in `shared/validation.py` as `ProcessingStatus` enum.
 
 ### Structured Logging
 
+**Destination**: Azure Application Insights (configured in `host.json`)
+
+- **Azure Portal**: Function App → Functions → `ingest_document` → Monitor
+- **Local dev**: Logs to terminal (stdout) when running `func start`
+
 All logs are JSON-formatted with standard fields:
 
 ```json
@@ -85,6 +90,15 @@ All logs are JSON-formatted with standard fields:
 ```
 
 Pipeline steps: `validate`, `read`, `parse`, `chunk`, `store`, `complete`, `error`
+
+**Query example** (Application Insights → Logs):
+```kusto
+traces
+| where timestamp > ago(1h)
+| extend parsed = parse_json(message)
+| where parsed.step == "parse"
+| project timestamp, parsed.file_path, parsed.duration_ms
+```
 
 ### Idempotency (TODO)
 
