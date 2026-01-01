@@ -10,8 +10,8 @@ import logging
 
 import azure.functions as func
 
-from ..shared.parser import detect_file_type, parse_pdf
-from ..shared.chunker import chunk_document
+from shared.parser import detect_file_type, parse_pdf
+from shared.chunker import chunk_document
 
 
 def main(blob: func.InputStream) -> None:
