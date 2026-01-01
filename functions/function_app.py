@@ -14,6 +14,7 @@ import azure.functions as func
 from shared.chunker import chunk_document
 from shared.logging_utils import structured_logger
 from shared.parser import detect_file_type, parse_pdf
+from shared.storage import store_document
 from shared.validation import (
     ProcessingStatus,
     validate_chunk_count,
@@ -199,19 +200,22 @@ def ingest_document(blob: func.InputStream) -> None:
                 text_length=len(chunk.text),
             )
 
-        # === STORAGE PHASE (TODO) ===
-        # TODO: Implement idempotency check before storage
-        # - Check if source with same file_path exists
-        # - If exists: delete-and-replace OR skip
-        # - Wrap in transaction for atomicity
+        # === STORAGE PHASE ===
+        # Store document and chunks with idempotency (delete-and-replace)
+        with structured_logger.timed_operation("store", "Store in database") as ctx:
+            source_id = store_document(doc, chunks, filename)
+            ctx["source_id"] = source_id
+            ctx["chunk_count"] = len(chunks)
+
+        status = ProcessingStatus.COMPLETE
 
         structured_logger.info(
             "store",
-            "Database storage pending - schema not yet defined",
+            "Document stored successfully",
+            source_id=source_id,
+            chunk_count=len(chunks),
             status=status.value,
         )
-
-        # Would set status = ProcessingStatus.COMPLETE after DB storage
 
     except Exception as e:
         status = ProcessingStatus.PARSE_FAILED
