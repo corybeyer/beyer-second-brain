@@ -1,7 +1,16 @@
-"""OpenAI embedding generation for semantic search.
+"""Embedding generation for semantic search.
 
+Supports Azure AI Foundry (default) or direct OpenAI API.
 Generates embeddings using text-embedding-3-small (1536 dimensions).
-Supports single and batch embedding with retry logic.
+
+Configuration:
+    Azure AI Foundry (recommended):
+        AZURE_OPENAI_ENDPOINT - Your Azure AI Foundry endpoint
+        AZURE_OPENAI_EMBEDDING_DEPLOYMENT - Deployment name for embedding model
+        (Uses managed identity by default, or AZURE_OPENAI_API_KEY if set)
+
+    Direct OpenAI (fallback):
+        OPENAI_API_KEY - OpenAI API key
 """
 
 import json
@@ -9,7 +18,8 @@ import os
 import time
 from typing import TYPE_CHECKING
 
-from openai import OpenAI, RateLimitError, APIError
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+from openai import AzureOpenAI, OpenAI, RateLimitError, APIError
 
 from .logging_utils import structured_logger
 
@@ -19,21 +29,84 @@ if TYPE_CHECKING:
 # Model configuration
 EMBEDDING_MODEL = "text-embedding-3-small"
 EMBEDDING_DIMENSIONS = 1536
-MAX_BATCH_SIZE = 100  # OpenAI supports up to 2048, but smaller batches are safer
+MAX_BATCH_SIZE = 100
 
 # Initialize client lazily
-_client: OpenAI | None = None
+_client: AzureOpenAI | OpenAI | None = None
+_deployment_name: str | None = None
 
 
-def _get_client() -> OpenAI:
-    """Get or create OpenAI client."""
-    global _client
-    if _client is None:
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY environment variable not set")
-        _client = OpenAI(api_key=api_key)
-    return _client
+def _get_client() -> AzureOpenAI | OpenAI:
+    """Get or create embedding client.
+
+    Prefers Azure AI Foundry with managed identity, falls back to direct OpenAI.
+    """
+    global _client, _deployment_name
+
+    if _client is not None:
+        return _client
+
+    # Try Azure AI Foundry first
+    azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    azure_key = os.environ.get("AZURE_OPENAI_API_KEY")
+    azure_deployment = os.environ.get("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
+
+    if azure_endpoint and azure_deployment:
+        if azure_key:
+            # Use API key if provided
+            structured_logger.info(
+                "embedding",
+                "Using Azure AI Foundry with API key",
+                endpoint=azure_endpoint[:50] + "...",
+            )
+            _client = AzureOpenAI(
+                azure_endpoint=azure_endpoint,
+                api_key=azure_key,
+                api_version="2024-02-01",
+            )
+        else:
+            # Use managed identity (DefaultAzureCredential)
+            structured_logger.info(
+                "embedding",
+                "Using Azure AI Foundry with managed identity",
+                endpoint=azure_endpoint[:50] + "...",
+            )
+            token_provider = get_bearer_token_provider(
+                DefaultAzureCredential(),
+                "https://cognitiveservices.azure.com/.default"
+            )
+            _client = AzureOpenAI(
+                azure_endpoint=azure_endpoint,
+                azure_ad_token_provider=token_provider,
+                api_version="2024-02-01",
+            )
+        _deployment_name = azure_deployment
+        return _client
+
+    # Fall back to direct OpenAI
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    if openai_key:
+        structured_logger.info(
+            "embedding",
+            "Using direct OpenAI API for embeddings",
+        )
+        _client = OpenAI(api_key=openai_key)
+        _deployment_name = EMBEDDING_MODEL
+        return _client
+
+    raise ValueError(
+        "No embedding API configured. Set either:\n"
+        "  - AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_EMBEDDING_DEPLOYMENT (Azure AI Foundry)\n"
+        "  - OPENAI_API_KEY (direct OpenAI)"
+    )
+
+
+def _get_model_name() -> str:
+    """Get the model/deployment name for API calls."""
+    global _deployment_name
+    if _deployment_name is None:
+        _get_client()  # Initialize client and deployment name
+    return _deployment_name or EMBEDDING_MODEL
 
 
 def get_embedding(text: str, max_retries: int = 3) -> list[float]:
@@ -51,12 +124,13 @@ def get_embedding(text: str, max_retries: int = 3) -> list[float]:
         APIError: If API call fails after retries
     """
     client = _get_client()
+    model = _get_model_name()
 
     for attempt in range(max_retries):
         try:
             response = client.embeddings.create(
                 input=text,
-                model=EMBEDDING_MODEL,
+                model=model,
             )
             return response.data[0].embedding
 
@@ -83,7 +157,6 @@ def get_embedding(text: str, max_retries: int = 3) -> list[float]:
             else:
                 raise
 
-    # Should not reach here, but satisfy type checker
     raise APIError("Max retries exceeded")
 
 
@@ -94,8 +167,7 @@ def get_embeddings_batch(
 ) -> list[list[float]]:
     """Generate embeddings for multiple texts efficiently.
 
-    Batches requests to OpenAI API for efficiency.
-    Handles rate limits with exponential backoff.
+    Batches requests for efficiency. Handles rate limits with exponential backoff.
 
     Args:
         texts: List of texts to embed
@@ -106,6 +178,7 @@ def get_embeddings_batch(
         List of embeddings in same order as input texts
     """
     client = _get_client()
+    model = _get_model_name()
     all_embeddings: list[list[float]] = []
 
     for i in range(0, len(texts), batch_size):
@@ -115,7 +188,7 @@ def get_embeddings_batch(
             try:
                 response = client.embeddings.create(
                     input=batch,
-                    model=EMBEDDING_MODEL,
+                    model=model,
                 )
                 batch_embeddings = [item.embedding for item in response.data]
                 all_embeddings.extend(batch_embeddings)
