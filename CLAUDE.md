@@ -251,14 +251,15 @@ second-brain/
 - [x] Database storage with idempotency (delete-and-replace pattern)
 - [x] Graph edges (from_source) linking chunks to sources
 
-### Phase 3: Concept Extraction & Graph ← CURRENT
-- [ ] Claude API integration for concept extraction
-- [ ] Concept extraction prompt design
-- [ ] Upsert concepts to SQL Graph nodes
-- [ ] Build edges (covers, mentions, related_to)
-- [ ] Test graph queries with MATCH syntax
+### Phase 3: Concept Extraction & Graph ✓ COMPLETE
+- [x] Claude API integration for concept extraction
+- [x] Concept extraction prompt design
+- [x] OpenAI embeddings for semantic search
+- [x] Upsert concepts to SQL Graph nodes
+- [x] Build edges (covers, mentions, related_to)
+- [x] Background scripts (cross-source pass, embedding similarity)
 
-### Phase 4: Streamlit Application
+### Phase 4: Streamlit Application ← CURRENT
 - [ ] Search interface (Claude-powered semantic search)
 - [ ] Concept explorer (graph visualization)
 - [ ] Source comparison view
@@ -272,19 +273,17 @@ second-brain/
 
 ---
 
-## Current Phase: 3 - Concept Extraction & Graph
+## Current Phase: 4 - Streamlit Application
 
 ### Detailed Tasks
-1. Design concept extraction prompt for Claude API
-2. Implement Claude API client with retry logic
-3. Extract concepts from each chunk (name, description, category)
-4. Upsert concepts to `concepts` NODE table
-5. Create `covers` edges (source → concept)
-6. Create `mentions` edges (chunk → concept)
-7. Identify related concepts and create `related_to` edges
-8. Test graph queries with MATCH syntax
+1. Set up Streamlit app structure (MVC pattern)
+2. Implement semantic search interface with VECTOR_DISTANCE queries
+3. Build concept explorer (list concepts, browse relationships)
+4. Create source comparison view (side-by-side concept coverage)
+5. Add RAG-powered Q&A (retrieve chunks, synthesize with Claude)
+6. Deploy to Azure Container Apps
 
-**Approach**: Process chunks in batches to respect rate limits. Use structured output for reliable parsing.
+**Approach**: Build incrementally - search first, then exploration features.
 
 ### Azure Resources (Phase 1 Complete)
 
@@ -473,5 +472,6 @@ WHERE MATCH(c1-(related_to)->c2)
 | 2026-01-01 | 2 | Implemented PDF parsing (PyMuPDF) with metadata and heading extraction. Built chunking system (page-based with size fallback, sentence-aware breaks, overlap). Wired blob trigger to parse and chunk PDFs. Ready to test with sample document. |
 | 2026-01-01 | 2 | Added System Behavior section: failure modes, processing states, idempotency, retry patterns, cost controls, observability, invariants, and contracts. Created /project:systems-check command. |
 | 2026-01-01 | 2→3 | Phase 2 complete. Implemented SQL Graph schema (3 NODE tables, 4 EDGE tables) with status tracking, idempotency constraints, and cascade deletes. Created init_db.py script and storage.py module. Schema deployed to Azure SQL via Portal. Moving to Phase 3 (concept extraction). |
+| 2026-01-01 | 3→4 | Phase 3 complete. Implemented embeddings.py (OpenAI text-embedding-3-small), concepts.py (Claude extraction with retry logic), graph.py (concept storage, mentions/related_to edges). Updated function_app.py with full pipeline (parse → chunk → embed → store → extract). Added background scripts for cross-source and embedding similarity passes. Ready for Phase 4 (Streamlit app). |
 
 ---

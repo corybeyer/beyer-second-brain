@@ -2,11 +2,11 @@
 
 Handles idempotent storage of sources and chunks to Azure SQL Graph.
 Implements delete-and-replace pattern for reprocessing.
+Supports optional embeddings storage.
 """
 
 import json
 import sys
-from dataclasses import asdict
 from pathlib import Path
 
 # Add project root for shared imports
@@ -100,13 +100,19 @@ def store_document(
             }
             chunk_metadata_json = json.dumps(chunk_metadata)
 
+            # Serialize embedding if present
+            embedding_json = None
+            if chunk.embedding is not None:
+                embedding_json = json.dumps(chunk.embedding)
+
             cursor.execute(
                 """
                 INSERT INTO chunks (
                     source_id, text, position, page_start, page_end,
-                    section, char_count, metadata
+                    section, char_count, embedding, metadata
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                OUTPUT INSERTED.id
+                VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS VECTOR(1536)), ?)
                 """,
                 (
                     source_id,
@@ -116,9 +122,14 @@ def store_document(
                     chunk.page_end,
                     chunk.section,
                     len(chunk.text),
+                    embedding_json,
                     chunk_metadata_json,
-                )
+                ),
             )
+            # Store the chunk ID for later use in concept extraction
+            row = cursor.fetchone()
+            if row:
+                chunk.id = row[0]
             chunk_count += 1
 
         structured_logger.info(

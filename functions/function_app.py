@@ -7,11 +7,18 @@ Implements System Behavior patterns from CLAUDE.md:
 - Processing states
 - Structured logging with timing
 - Cost controls
+
+Pipeline steps:
+1. Parse PDF → 2. Chunk → 3. Embed → 4. Store → 5. Extract Concepts
 """
+
+import os
 
 import azure.functions as func
 
 from shared.chunker import chunk_document
+from shared.embeddings import embed_chunks
+from shared.graph import process_source_concepts
 from shared.logging_utils import structured_logger
 from shared.parser import detect_file_type, parse_pdf
 from shared.storage import store_document
@@ -24,6 +31,10 @@ from shared.validation import (
     validate_page_count,
     validate_pdf_magic_bytes,
 )
+
+# Feature flags for optional pipeline steps
+ENABLE_EMBEDDINGS = os.environ.get("ENABLE_EMBEDDINGS", "true").lower() == "true"
+ENABLE_CONCEPTS = os.environ.get("ENABLE_CONCEPTS", "true").lower() == "true"
 
 app = func.FunctionApp()
 
@@ -174,7 +185,7 @@ def ingest_document(blob: func.InputStream) -> None:
 
         status = ProcessingStatus.PARSED
 
-        # Log document structure for schema design
+        # Log document structure
         structure = {
             "filename": doc.filename,
             "title": doc.title,
@@ -189,15 +200,23 @@ def ingest_document(blob: func.InputStream) -> None:
             structure=structure,
         )
 
-        # Log sample chunks for exploration
-        for i, chunk in enumerate(chunks[:3]):
+        # === EMBEDDING PHASE (optional) ===
+        if ENABLE_EMBEDDINGS:
+            with structured_logger.timed_operation(
+                "embedding", f"Generating embeddings for {len(chunks)} chunks"
+            ) as ctx:
+                chunks = embed_chunks(chunks)
+                ctx["chunks_embedded"] = len(chunks)
+
             structured_logger.info(
-                "chunk",
-                f"Sample chunk {i}",
-                chunk_position=chunk.position,
-                page_start=chunk.page_start,
-                section=chunk.section,
-                text_length=len(chunk.text),
+                "embedding",
+                "Embeddings generated",
+                chunk_count=len(chunks),
+            )
+        else:
+            structured_logger.info(
+                "embedding",
+                "Embedding generation disabled",
             )
 
         # === STORAGE PHASE ===
@@ -207,11 +226,42 @@ def ingest_document(blob: func.InputStream) -> None:
             ctx["source_id"] = source_id
             ctx["chunk_count"] = len(chunks)
 
-        status = ProcessingStatus.COMPLETE
-
         structured_logger.info(
             "store",
             "Document stored successfully",
+            source_id=source_id,
+            chunk_count=len(chunks),
+        )
+
+        # === CONCEPT EXTRACTION PHASE (optional) ===
+        if ENABLE_CONCEPTS:
+            with structured_logger.timed_operation(
+                "concepts", "Extracting concepts"
+            ) as ctx:
+                stats = process_source_concepts(source_id, chunks)
+                ctx["concepts_extracted"] = stats["concepts_extracted"]
+                ctx["relationships_created"] = stats["relationships_created"]
+
+            structured_logger.info(
+                "concepts",
+                "Concept extraction complete",
+                source_id=source_id,
+                stats=stats,
+            )
+        else:
+            structured_logger.info(
+                "concepts",
+                "Concept extraction disabled",
+            )
+            # Update status to COMPLETE if concepts are disabled
+            from shared.storage import update_source_status
+            update_source_status(source_id, "COMPLETE")
+
+        status = ProcessingStatus.COMPLETE
+
+        structured_logger.info(
+            "complete",
+            "Pipeline complete",
             source_id=source_id,
             chunk_count=len(chunks),
             status=status.value,

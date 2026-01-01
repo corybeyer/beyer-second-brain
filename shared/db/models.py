@@ -57,6 +57,7 @@ CREATE TABLE chunks (
     page_end INT,
     section NVARCHAR(500),              -- Heading or chapter name
     char_count INT NOT NULL,            -- For cost tracking
+    embedding VECTOR(1536),             -- OpenAI text-embedding-3-small
     metadata NVARCHAR(MAX),             -- JSON for additional fields
     created_at DATETIME2 NOT NULL DEFAULT GETDATE(),
     CONSTRAINT FK_chunks_source FOREIGN KEY (source_id)
@@ -72,6 +73,7 @@ CREATE TABLE concepts (
     name NVARCHAR(255) NOT NULL,
     description NVARCHAR(MAX),
     category NVARCHAR(100),             -- 'methodology', 'principle', 'tool', etc.
+    embedding VECTOR(1536),             -- For concept similarity search
     created_at DATETIME2 NOT NULL DEFAULT GETDATE(),
     updated_at DATETIME2 NOT NULL DEFAULT GETDATE()
 ) AS NODE;
