@@ -25,8 +25,73 @@ Chunker (page-based + size-based)
 | `function_app.py` | Main entry point, v2 programming model with decorator |
 | `shared/parser.py` | PDF parsing with PyMuPDF, metadata extraction |
 | `shared/chunker.py` | Text chunking with page boundaries and overlap |
+| `shared/validation.py` | Input validation, cost controls, processing states |
+| `shared/logging_utils.py` | Structured JSON logging with timing |
+| `shared/__init__.py` | Module exports |
 | `requirements.txt` | Python dependencies |
 | `host.json` | Azure Functions host configuration |
+
+---
+
+## System Behavior Implementation
+
+This function implements patterns from the project's System Behavior spec (see root CLAUDE.md).
+
+### Cost Controls
+
+| Control | Limit | Constant |
+|---------|-------|----------|
+| Max file size | 100 MB | `MAX_FILE_SIZE_BYTES` |
+| Max pages | 1000 | `MAX_PAGES` |
+| Max chunks per source | 500 | `MAX_CHUNKS_PER_SOURCE` |
+| Max chunk size | 4000 chars | `MAX_CHUNK_SIZE` |
+| Min text length | 100 chars | `MIN_TEXT_LENGTH` |
+
+### Processing States
+
+```
+UPLOADED → PARSING → PARSED → EXTRACTING → COMPLETE
+              ↓                    ↓
+           PARSE_FAILED      EXTRACT_FAILED
+```
+
+Defined in `shared/validation.py` as `ProcessingStatus` enum.
+
+### Validation Pipeline
+
+1. **File size** - Reject files > 100 MB (prevents timeout)
+2. **File type** - Check extension is `.pdf`
+3. **Magic bytes** - Verify file starts with `%PDF-` (security)
+4. **Page count** - Reject documents > 1000 pages (cost control)
+5. **Minimum text** - Reject if < 100 chars extracted (catches scanned PDFs)
+6. **Chunk count** - Reject if > 500 chunks (cost control)
+7. **Chunk positions** - Verify sequential positions (invariant)
+8. **Non-empty chunks** - Ensure at least one chunk created (invariant)
+
+### Structured Logging
+
+All logs are JSON-formatted with standard fields:
+
+```json
+{
+  "timestamp": "2026-01-01T12:00:00Z",
+  "level": "INFO",
+  "step": "parse",
+  "message": "Document parsed successfully",
+  "file_path": "documents/data-mesh.pdf",
+  "duration_ms": 1523,
+  "page_count": 87
+}
+```
+
+Pipeline steps: `validate`, `read`, `parse`, `chunk`, `store`, `complete`, `error`
+
+### Idempotency (TODO)
+
+When database storage is implemented:
+- Check if source with same `file_path` exists
+- Strategy: delete-and-replace OR skip if exists
+- Wrap operations in transaction for atomicity
 
 ---
 
