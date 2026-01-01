@@ -100,6 +100,8 @@ def store_document(
             if chunk.embedding is not None:
                 embedding_json = json.dumps(chunk.embedding)
 
+            # Store embedding as JSON string (native vector type not available)
+            # Can be converted to vector later when Azure SQL vector support is enabled
             cursor.execute(
                 """
                 INSERT INTO chunks (
@@ -107,7 +109,7 @@ def store_document(
                     section, char_count, embedding, metadata
                 )
                 OUTPUT INSERTED.id
-                VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS VECTOR(1536)), ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     source_id,
