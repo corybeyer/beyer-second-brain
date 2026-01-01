@@ -46,6 +46,7 @@ jobs:
 
           # Step 2: Reinstall binary packages with manylinux_2_17 wheels
           # This overwrites the Ubuntu-compiled binaries with GLIBC-compatible ones
+          # cryptography<41 is required because >=41 only has manylinux_2_28 wheels
           echo "=== Step 2: Reinstalling binary packages with manylinux_2_17 ==="
           pip install \
             --target=".python_packages/lib/site-packages" \
@@ -55,7 +56,7 @@ jobs:
             --only-binary=:all: \
             --force-reinstall \
             --no-deps \
-            pymupdf pyodbc cryptography
+            "pymupdf" "pyodbc" "cryptography>=40.0.0,<41.0.0"
 
           # List installed packages
           echo "=== Installed packages ==="
