@@ -26,7 +26,7 @@ class ProcessingStatus(Enum):
 
 
 # Cost control limits (from CLAUDE.md System Behavior)
-MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024  # 100 MB
+MAX_FILE_SIZE_BYTES = 250 * 1024 * 1024  # 250 MB - increased for large textbooks
 MAX_PAGES = 1000
 MAX_CHUNKS_PER_SOURCE = 500
 MAX_CHUNK_SIZE = 4000  # chars
