@@ -33,32 +33,55 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies with manylinux wheels
+      - name: Install dependencies with manylinux_2_17 wheels
         run: |
           cd functions
-          # Install dependencies using manylinux2014 wheels for GLIBC compatibility
-          # Azure Functions Linux runtime has older GLIBC than Ubuntu runners
+
+          # Create target directory
+          mkdir -p .python_packages/lib/site-packages
+
+          # Install with manylinux_2_17 wheels for Azure Functions compatibility
+          # manylinux_2_17 requires GLIBC 2.17 which Azure Functions has
+          echo "Installing dependencies with manylinux_2_17 platform..."
           pip install \
             --target=".python_packages/lib/site-packages" \
-            --platform manylinux2014_x86_64 \
+            --platform manylinux_2_17_x86_64 \
             --implementation cp \
             --python-version 3.11 \
             --only-binary=:all: \
-            -r requirements.txt || {
-              echo "Some packages don't have manylinux2014 wheels, trying manylinux_2_17..."
-              pip install \
-                --target=".python_packages/lib/site-packages" \
-                --platform manylinux_2_17_x86_64 \
-                --implementation cp \
-                --python-version 3.11 \
-                --only-binary=:all: \
-                -r requirements.txt
-            }
+            --no-deps \
+            -r requirements.txt
+
+          # Now install with deps resolution (some pure-python packages need this)
+          echo "Installing remaining dependencies..."
+          pip install \
+            --target=".python_packages/lib/site-packages" \
+            --platform manylinux_2_17_x86_64 \
+            --implementation cp \
+            --python-version 3.11 \
+            --only-binary=:all: \
+            -r requirements.txt
+
+          # List installed packages for debugging
+          echo "Installed packages:"
+          ls -la .python_packages/lib/site-packages/ | head -50
+
+          # Verify key packages are present
+          echo "Checking for key packages..."
+          for pkg in fitz pymupdf pyodbc anthropic openai; do
+            if ls .python_packages/lib/site-packages/ | grep -qi "$pkg"; then
+              echo "  $pkg: FOUND"
+            else
+              echo "  $pkg: NOT FOUND"
+            fi
+          done
 
       - name: Zip artifact for deployment
         run: |
           cd functions
           zip -r ../release.zip . -x "*.pyc" -x "__pycache__/*" -x ".python_packages/lib/site-packages/pip*" -x ".python_packages/lib/site-packages/setuptools*"
+          echo "Zip file size:"
+          ls -lh ../release.zip
 
       - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v4
