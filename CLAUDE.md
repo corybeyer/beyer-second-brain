@@ -442,6 +442,7 @@ WHERE MATCH(c1-(related_to)->c2)
 - Environment variables for secrets (never commit .env)
 - Run `/project:judge` after writing code
 - Run `/project:security` before committing
+- **Before committing**: Verify code against System Behavior patterns (failure modes, idempotency, retries, cost controls, observability). Report gaps to user before proceeding.
 
 ---
 
