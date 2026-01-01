@@ -85,3 +85,5 @@ jobs:
           app-name: 'func-secondbrain'
           slot-name: 'Production'
           package: 'deploy'
+          scm-do-build-during-deployment: true
+          enable-oryx-build: true
