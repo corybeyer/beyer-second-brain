@@ -100,27 +100,50 @@ def store_document(
             if chunk.embedding is not None:
                 embedding_json = json.dumps(chunk.embedding)
 
-            cursor.execute(
-                """
-                INSERT INTO chunks (
-                    source_id, text, position, page_start, page_end,
-                    section, char_count, embedding, metadata
+            # Build SQL based on whether embedding exists
+            if embedding_json is not None:
+                cursor.execute(
+                    """
+                    INSERT INTO chunks (
+                        source_id, text, position, page_start, page_end,
+                        section, char_count, embedding, metadata
+                    )
+                    OUTPUT INSERTED.id
+                    VALUES (?, ?, ?, ?, ?, ?, ?, JSON_ARRAY_TO_VECTOR(?), ?)
+                    """,
+                    (
+                        source_id,
+                        chunk.text,
+                        chunk.position,
+                        chunk.page_start,
+                        chunk.page_end,
+                        chunk.section,
+                        len(chunk.text),
+                        embedding_json,
+                        chunk_metadata_json,
+                    ),
                 )
-                OUTPUT INSERTED.id
-                VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS VECTOR(1536)), ?)
-                """,
-                (
-                    source_id,
-                    chunk.text,
-                    chunk.position,
-                    chunk.page_start,
-                    chunk.page_end,
-                    chunk.section,
-                    len(chunk.text),
-                    embedding_json,
-                    chunk_metadata_json,
-                ),
-            )
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO chunks (
+                        source_id, text, position, page_start, page_end,
+                        section, char_count, embedding, metadata
+                    )
+                    OUTPUT INSERTED.id
+                    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                    """,
+                    (
+                        source_id,
+                        chunk.text,
+                        chunk.position,
+                        chunk.page_start,
+                        chunk.page_end,
+                        chunk.section,
+                        len(chunk.text),
+                        chunk_metadata_json,
+                    ),
+                )
             # Store the chunk ID for later use in concept extraction
             row = cursor.fetchone()
             if row:
