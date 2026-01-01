@@ -12,31 +12,82 @@ Pipeline steps:
 1. Parse PDF → 2. Chunk → 3. Embed → 4. Store → 5. Extract Concepts
 """
 
+import logging
 import os
 
 import azure.functions as func
 
-from shared.chunker import chunk_document
-from shared.embeddings import embed_chunks
-from shared.graph import process_source_concepts
-from shared.logging_utils import structured_logger
-from shared.parser import detect_file_type, parse_pdf
-from shared.storage import store_document
-from shared.validation import (
-    ProcessingStatus,
-    validate_chunk_count,
-    validate_chunk_positions,
-    validate_file_size,
-    validate_minimum_text,
-    validate_page_count,
-    validate_pdf_magic_bytes,
-)
+# Lazy imports to avoid startup failures - these are imported inside functions
+# from shared.chunker import chunk_document
+# from shared.embeddings import embed_chunks
+# from shared.graph import process_source_concepts
+# from shared.logging_utils import structured_logger
+# from shared.parser import detect_file_type, parse_pdf
+# from shared.storage import store_document
+# from shared.validation import (...)
 
 # Feature flags for optional pipeline steps
 ENABLE_EMBEDDINGS = os.environ.get("ENABLE_EMBEDDINGS", "true").lower() == "true"
 ENABLE_CONCEPTS = os.environ.get("ENABLE_CONCEPTS", "true").lower() == "true"
 
 app = func.FunctionApp()
+
+
+@app.function_name(name="health")
+@app.route(route="health", auth_level=func.AuthLevel.ANONYMOUS)
+def health_check(req: func.HttpRequest) -> func.HttpResponse:
+    """Health check endpoint to verify function deployment.
+
+    This function has no dependencies beyond azure.functions,
+    so it should always work if deployment succeeded.
+
+    Test with: curl https://func-secondbrain.azurewebsites.net/api/health
+    """
+    import sys
+
+    # Test imports and report which ones fail
+    import_status = {}
+
+    modules_to_test = [
+        ("fitz", "PyMuPDF - PDF parsing"),
+        ("pyodbc", "pyodbc - SQL Server connection"),
+        ("anthropic", "anthropic - Claude API"),
+        ("openai", "openai - Embeddings API"),
+    ]
+
+    for module_name, description in modules_to_test:
+        try:
+            __import__(module_name)
+            import_status[module_name] = "OK"
+        except ImportError as e:
+            import_status[module_name] = f"FAILED: {e}"
+        except Exception as e:
+            import_status[module_name] = f"ERROR: {type(e).__name__}: {e}"
+
+    # Build response
+    lines = [
+        "Second Brain Function App - Health Check",
+        "=" * 40,
+        f"Python version: {sys.version}",
+        f"Platform: {sys.platform}",
+        "",
+        "Import Status:",
+    ]
+
+    all_ok = True
+    for module_name, status in import_status.items():
+        lines.append(f"  {module_name}: {status}")
+        if status != "OK":
+            all_ok = False
+
+    lines.append("")
+    lines.append(f"Overall: {'HEALTHY' if all_ok else 'UNHEALTHY - check imports above'}")
+
+    return func.HttpResponse(
+        "\n".join(lines),
+        status_code=200 if all_ok else 500,
+        mimetype="text/plain"
+    )
 
 
 @app.blob_trigger(
@@ -57,16 +108,34 @@ def ingest_document(blob: func.InputStream) -> None:
     Args:
         blob: Input stream from blob trigger
     """
+    # Lazy imports to avoid startup failures
+    from shared.chunker import chunk_document
+    from shared.embeddings import embed_chunks
+    from shared.graph import process_source_concepts
+    from shared.logging_utils import structured_logger
+    from shared.parser import detect_file_type, parse_pdf
+    from shared.storage import store_document, update_source_status
+    from shared.validation import (
+        ProcessingStatus,
+        validate_chunk_count,
+        validate_chunk_positions,
+        validate_file_size,
+        validate_minimum_text,
+        validate_page_count,
+        validate_pdf_magic_bytes,
+    )
+
     filename = blob.name or "unknown"
     file_size = blob.length or 0
+    status_str = "UPLOADED"  # Track status as string for finally block
 
     # Set logging context for all subsequent logs
     structured_logger.set_context(file_path=filename)
-    status = ProcessingStatus.UPLOADED
 
     try:
         # === VALIDATION PHASE ===
         status = ProcessingStatus.PARSING
+        status_str = "PARSING"
 
         # 1. Validate file size (cost control)
         size_result = validate_file_size(file_size)
@@ -107,6 +176,7 @@ def ingest_document(blob: func.InputStream) -> None:
                 magic_result.error_message or "Magic bytes validation failed",
             )
             status = ProcessingStatus.PARSE_FAILED
+            status_str = "PARSE_FAILED"
             # TODO: Store status in DB when implemented
             return
 
@@ -128,6 +198,7 @@ def ingest_document(blob: func.InputStream) -> None:
                 page_count=doc.page_count,
             )
             status = ProcessingStatus.PARSE_FAILED
+            status_str = "PARSE_FAILED"
             return
 
         # 6. Validate minimum text (catch scanned/image PDFs)
@@ -139,6 +210,7 @@ def ingest_document(blob: func.InputStream) -> None:
                 text_length=len(doc.full_text.strip()),
             )
             status = ProcessingStatus.PARSE_FAILED
+            status_str = "PARSE_FAILED"
             return
 
         structured_logger.info(
@@ -162,6 +234,7 @@ def ingest_document(blob: func.InputStream) -> None:
                 chunk_count=len(chunks),
             )
             status = ProcessingStatus.PARSE_FAILED
+            status_str = "PARSE_FAILED"
             return
 
         # 8. Validate chunk positions are sequential (invariant)
@@ -172,6 +245,7 @@ def ingest_document(blob: func.InputStream) -> None:
                 position_result.error_message or "Chunk positions invalid",
             )
             status = ProcessingStatus.PARSE_FAILED
+            status_str = "PARSE_FAILED"
             return
 
         # 9. Validate at least one chunk exists (invariant for COMPLETE status)
@@ -181,9 +255,11 @@ def ingest_document(blob: func.InputStream) -> None:
                 "No chunks created from document",
             )
             status = ProcessingStatus.PARSE_FAILED
+            status_str = "PARSE_FAILED"
             return
 
         status = ProcessingStatus.PARSED
+        status_str = "PARSED"
 
         # Log document structure
         structure = {
@@ -254,34 +330,28 @@ def ingest_document(blob: func.InputStream) -> None:
                 "Concept extraction disabled",
             )
             # Update status to COMPLETE if concepts are disabled
-            from shared.storage import update_source_status
             update_source_status(source_id, "COMPLETE")
 
         status = ProcessingStatus.COMPLETE
+        status_str = "COMPLETE"
 
         structured_logger.info(
             "complete",
             "Pipeline complete",
             source_id=source_id,
             chunk_count=len(chunks),
-            status=status.value,
+            status=status_str,
         )
 
     except Exception as e:
-        status = ProcessingStatus.PARSE_FAILED
-        structured_logger.error(
-            "error",
-            f"Processing failed: {e!s}",
-            error_type=type(e).__name__,
-            status=status.value,
-        )
+        status_str = "PARSE_FAILED"
+        logging.error(f"Processing failed: {e!s}", exc_info=True)
         # Re-raise to let Azure Functions handle retry
         raise
 
     finally:
-        structured_logger.info(
-            "complete",
-            f"Processing finished with status: {status.value}",
-            final_status=status.value,
-        )
-        structured_logger.clear_context()
+        logging.info(f"Processing finished with status: {status_str}")
+        try:
+            structured_logger.clear_context()
+        except Exception:
+            pass  # Ignore if logger wasn't initialized
