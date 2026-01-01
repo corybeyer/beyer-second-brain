@@ -187,6 +187,62 @@ ALTER ROLE db_datawriter ADD MEMBER [func-secondbrain];
 
 ---
 
+## Step 7: Configure Function App Settings for Blob Trigger
+
+The blob trigger needs proper connection configuration to access the storage account.
+
+### Option A: Using Managed Identity (Recommended)
+
+1. Go to `func-secondbrain` → **Settings** → **Environment variables**
+2. Add these app settings:
+
+| Name | Value |
+|------|-------|
+| `AzureWebJobsStorage__accountName` | `stsecondbrain` |
+| `AzureWebJobsStorage__credential` | `managedidentity` |
+
+3. Verify the Function App's managed identity has **Storage Blob Data Owner** role on `stsecondbrain` (not just Contributor - Owner is needed for blob triggers)
+
+### Option B: Using Connection String
+
+1. Go to `stsecondbrain` → **Security + networking** → **Access keys**
+2. Copy the **Connection string** for key1
+3. Go to `func-secondbrain` → **Settings** → **Environment variables**
+4. Set `AzureWebJobsStorage` to the connection string
+
+### Verify Blob Trigger is Working
+
+1. Go to `func-secondbrain` → **Functions** → `ingest_document`
+2. Check **Monitor** tab for invocation logs
+3. Upload a PDF to the `documents` container
+4. Watch for function invocation in logs (may take 1-2 minutes on Consumption plan)
+
+---
+
+## Troubleshooting Blob Trigger
+
+If the function doesn't fire when you upload a file:
+
+1. **Check Function App is running**: Go to Overview, verify Status is "Running"
+2. **Check logs**: Go to Functions → ingest_document → Monitor → Logs
+3. **Verify storage connection**: Environment variables → `AzureWebJobsStorage*` settings
+4. **Check RBAC**: Function identity needs Storage Blob Data Owner (not just Contributor)
+5. **Check plan type**: Flex Consumption requires Event Grid; regular Consumption uses polling
+
+### For Flex Consumption Plans (Event Grid Required)
+
+If you created a Flex Consumption plan, you MUST set up Event Grid:
+
+1. Go to `stsecondbrain` → **Events** → **+ Event Subscription**
+2. Configure:
+   - **Name**: `blob-trigger-subscription`
+   - **Event Types**: Blob Created
+   - **Endpoint Type**: Azure Function
+   - **Endpoint**: Select `func-secondbrain` → `ingest_document`
+3. Filter to your container: Subject begins with `/blobServices/default/containers/documents/`
+
+---
+
 ## Next Steps
 
 1. Create SQL Graph schema (NODE/EDGE tables)

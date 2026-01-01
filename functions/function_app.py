@@ -13,8 +13,7 @@ app = func.FunctionApp()
 @app.blob_trigger(
     arg_name="blob",
     path="documents/{name}",
-    connection="AzureWebJobsStorage",
-    source="EventGrid"
+    connection="AzureWebJobsStorage"
 )
 def ingest_document(blob: func.InputStream) -> None:
     """Process uploaded document.
