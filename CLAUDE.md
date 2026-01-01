@@ -125,10 +125,9 @@ second-brain/
 ### Phase 2: Ingestion Pipeline (Azure Function) ← CURRENT
 - [x] Align codebase with Azure SQL architecture (remove PostgreSQL code)
 - [x] Blob trigger function scaffold
-- [ ] PDF text extraction (PyMuPDF)
-- [ ] Markdown parsing
-- [ ] Chunking strategy (section/heading level)
-- [ ] Explore parsed document structure
+- [x] PDF text extraction (PyMuPDF)
+- [x] Chunking strategy (page-based + size-based with overlap)
+- [ ] Explore parsed document structure (upload test PDF)
 - [ ] Define SQL Graph schema based on parsing results
 - [ ] Store sources + chunks in Azure SQL
 
@@ -157,13 +156,12 @@ second-brain/
 
 ### Detailed Tasks
 1. ~~Set up blob trigger function scaffold~~ ✓
-2. Implement PDF parsing with PyMuPDF
-3. Implement Markdown parsing
-4. Build chunking logic (heading-based + size-based)
-5. Explore parsed document structure with sample files
-6. Define SQL Graph schema based on actual parsing results
-7. Store sources + chunks in Azure SQL
-8. Test end-to-end with sample document
+2. ~~Implement PDF parsing with PyMuPDF~~ ✓
+3. ~~Build chunking logic (page-based + size-based)~~ ✓
+4. Upload test PDF to explore parsed structure
+5. Define SQL Graph schema based on actual parsing results
+6. Store sources + chunks in Azure SQL
+7. Test end-to-end with sample document
 
 **Approach**: Parse documents first, then design schema based on actual data structure needs.
 
@@ -334,5 +332,6 @@ WHERE MATCH(c1-(related_to)->c2)
 | 2025-12-31 | 1 | Architecture pivot: PostgreSQL → Azure SQL (for SQL Graph), removed pgvector/embeddings in favor of Claude API for search, added Azure Functions for ingestion, generalized schema from books to sources |
 | 2025-12-31 | 1→2 | Phase 1 complete. Azure resources created via Portal: Resource Group, Storage Account + container, Function App, SQL Database. Configured managed identity for Function → Storage and Function → SQL. Moved to Phase 2. |
 | 2025-12-31 | 2 | Aligned codebase with Azure SQL architecture: rewrote db connection for pyodbc, removed PostgreSQL/pgvector/OpenAI code, restructured pipeline/ → functions/, created function scaffold with blob trigger, updated all scripts and dependencies. Schema deferred until after parsing exploration. |
+| 2026-01-01 | 2 | Implemented PDF parsing (PyMuPDF) with metadata and heading extraction. Built chunking system (page-based with size fallback, sentence-aware breaks, overlap). Wired blob trigger to parse and chunk PDFs. Ready to test with sample document. |
 
 ---
