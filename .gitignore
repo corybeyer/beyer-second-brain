@@ -21,6 +21,10 @@ build/
 .DS_Store
 Thumbs.db
 
+# Azure Functions
+local.settings.json
+azure-export/
+
 # Project specific
 *.pdf
 data/
