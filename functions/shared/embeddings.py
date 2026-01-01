@@ -6,8 +6,8 @@ Generates embeddings using text-embedding-3-small (1536 dimensions).
 Configuration:
     Azure AI Foundry (recommended):
         AZURE_OPENAI_ENDPOINT - Your Azure AI Foundry endpoint
-        AZURE_OPENAI_API_KEY - API key (or use managed identity)
         AZURE_OPENAI_EMBEDDING_DEPLOYMENT - Deployment name for embedding model
+        (Uses managed identity by default, or AZURE_OPENAI_API_KEY if set)
 
     Direct OpenAI (fallback):
         OPENAI_API_KEY - OpenAI API key
@@ -18,6 +18,7 @@ import os
 import time
 from typing import TYPE_CHECKING
 
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from openai import AzureOpenAI, OpenAI, RateLimitError, APIError
 
 from .logging_utils import structured_logger
@@ -38,7 +39,7 @@ _deployment_name: str | None = None
 def _get_client() -> AzureOpenAI | OpenAI:
     """Get or create embedding client.
 
-    Prefers Azure AI Foundry if configured, falls back to direct OpenAI.
+    Prefers Azure AI Foundry with managed identity, falls back to direct OpenAI.
     """
     global _client, _deployment_name
 
@@ -51,16 +52,34 @@ def _get_client() -> AzureOpenAI | OpenAI:
     azure_deployment = os.environ.get("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
 
     if azure_endpoint and azure_deployment:
-        structured_logger.info(
-            "embedding",
-            "Using Azure AI Foundry for embeddings",
-            endpoint=azure_endpoint[:50] + "...",
-        )
-        _client = AzureOpenAI(
-            azure_endpoint=azure_endpoint,
-            api_key=azure_key,  # Can be None if using managed identity
-            api_version="2024-02-01",
-        )
+        if azure_key:
+            # Use API key if provided
+            structured_logger.info(
+                "embedding",
+                "Using Azure AI Foundry with API key",
+                endpoint=azure_endpoint[:50] + "...",
+            )
+            _client = AzureOpenAI(
+                azure_endpoint=azure_endpoint,
+                api_key=azure_key,
+                api_version="2024-02-01",
+            )
+        else:
+            # Use managed identity (DefaultAzureCredential)
+            structured_logger.info(
+                "embedding",
+                "Using Azure AI Foundry with managed identity",
+                endpoint=azure_endpoint[:50] + "...",
+            )
+            token_provider = get_bearer_token_provider(
+                DefaultAzureCredential(),
+                "https://cognitiveservices.azure.com/.default"
+            )
+            _client = AzureOpenAI(
+                azure_endpoint=azure_endpoint,
+                azure_ad_token_provider=token_provider,
+                api_version="2024-02-01",
+            )
         _deployment_name = azure_deployment
         return _client
 
