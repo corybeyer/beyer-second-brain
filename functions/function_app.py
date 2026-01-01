@@ -1,4 +1,7 @@
-"""Azure Functions app using v2 programming model."""
+"""Azure Functions app using v2 programming model.
+
+Requires AzureWebJobsFeatureFlags=EnableWorkerIndexing app setting.
+"""
 
 import json
 import logging
