@@ -33,42 +33,37 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies with manylinux_2_17 wheels
+      - name: Install dependencies
         run: |
           cd functions
-
-          # Create target directory
           mkdir -p .python_packages/lib/site-packages
 
-          # Install with manylinux_2_17 wheels for Azure Functions compatibility
-          # manylinux_2_17 requires GLIBC 2.17 which Azure Functions has
-          echo "Installing dependencies with manylinux_2_17 platform..."
+          # Step 1: Install ALL dependencies (gets pure Python packages)
+          echo "=== Step 1: Installing all dependencies ==="
+          pip install \
+            --target=".python_packages/lib/site-packages" \
+            -r requirements.txt
+
+          # Step 2: Reinstall binary packages with manylinux_2_17 wheels
+          # This overwrites the Ubuntu-compiled binaries with GLIBC-compatible ones
+          echo "=== Step 2: Reinstalling binary packages with manylinux_2_17 ==="
           pip install \
             --target=".python_packages/lib/site-packages" \
             --platform manylinux_2_17_x86_64 \
             --implementation cp \
             --python-version 3.11 \
             --only-binary=:all: \
+            --force-reinstall \
             --no-deps \
-            -r requirements.txt
+            pymupdf pyodbc cryptography
 
-          # Now install with deps resolution (some pure-python packages need this)
-          echo "Installing remaining dependencies..."
-          pip install \
-            --target=".python_packages/lib/site-packages" \
-            --platform manylinux_2_17_x86_64 \
-            --implementation cp \
-            --python-version 3.11 \
-            --only-binary=:all: \
-            -r requirements.txt
+          # List installed packages
+          echo "=== Installed packages ==="
+          ls -la .python_packages/lib/site-packages/ | head -60
 
-          # List installed packages for debugging
-          echo "Installed packages:"
-          ls -la .python_packages/lib/site-packages/ | head -50
-
-          # Verify key packages are present
-          echo "Checking for key packages..."
-          for pkg in fitz pymupdf pyodbc anthropic openai; do
+          # Verify key packages
+          echo "=== Verifying key packages ==="
+          for pkg in fitz pymupdf pyodbc anthropic openai azure; do
             if ls .python_packages/lib/site-packages/ | grep -qi "$pkg"; then
               echo "  $pkg: FOUND"
             else
