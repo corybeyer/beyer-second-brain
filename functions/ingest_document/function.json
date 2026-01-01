@@ -6,6 +6,7 @@
       "type": "blobTrigger",
       "direction": "in",
       "path": "documents/{name}",
+      "source": "EventGrid",
       "connection": "AzureWebJobsStorage"
     }
   ]
