@@ -15,7 +15,13 @@ PDF Parser (PyMuPDF/fitz)
         ↓
 Chunker (page-based + size-based)
         ↓
-[Future] Azure SQL Graph
+Embeddings (OpenAI/Azure AI)
+        ↓
+Azure SQL Graph (sources, chunks)
+        ↓
+Concept Extraction (Claude API)
+        ↓
+Azure SQL Graph (concepts, edges)
 ```
 
 ## Files
@@ -27,6 +33,10 @@ Chunker (page-based + size-based)
 | `shared/chunker.py` | Text chunking with page boundaries and overlap |
 | `shared/validation.py` | Input validation, cost controls, processing states |
 | `shared/logging_utils.py` | Structured JSON logging with timing |
+| `shared/storage.py` | Database storage with idempotency (delete-and-replace) |
+| `shared/embeddings.py` | OpenAI/Azure AI embeddings for semantic search |
+| `shared/concepts.py` | Claude API for concept extraction |
+| `shared/graph.py` | SQL Graph storage for concepts and relationships |
 | `shared/__init__.py` | Module exports |
 | `requirements.txt` | Python dependencies |
 | `host.json` | Azure Functions host configuration |
@@ -100,12 +110,13 @@ traces
 | project timestamp, parsed.file_path, parsed.duration_ms
 ```
 
-### Idempotency (TODO)
+### Idempotency
 
-When database storage is implemented:
+Implemented in `shared/storage.py` using delete-and-replace pattern:
 - Check if source with same `file_path` exists
-- Strategy: delete-and-replace OR skip if exists
-- Wrap operations in transaction for atomicity
+- Delete existing source (CASCADE removes chunks, edges)
+- Insert new source and chunks in single transaction
+- All operations wrapped in transaction for atomicity
 
 ---
 
@@ -287,7 +298,12 @@ On Consumption plan, blob trigger uses polling:
 
 ## Next Steps
 
-Per project CLAUDE.md Phase 2:
-- [ ] Define SQL Graph schema based on parsed document structure
-- [ ] Store sources + chunks in Azure SQL
-- [ ] Test end-to-end with sample document
+Per project CLAUDE.md Phase 4 (Streamlit Application):
+- [ ] Set up Streamlit app structure (MVC pattern)
+- [ ] Implement semantic search interface with VECTOR_DISTANCE queries
+- [ ] Build concept explorer (list concepts, browse relationships)
+- [ ] Create source comparison view (side-by-side concept coverage)
+- [ ] Add RAG-powered Q&A (retrieve chunks, synthesize with Claude)
+- [ ] Deploy to Azure Container Apps
+
+Phase 2 (Ingestion Pipeline) and Phase 3 (Concept Extraction) are complete.
