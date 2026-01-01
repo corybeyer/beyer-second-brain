@@ -242,16 +242,16 @@ second-brain/
 - [x] Managed identity: Function → Storage (Storage Blob Data Contributor)
 - [x] Managed identity: Function → SQL (db_datareader, db_datawriter)
 
-### Phase 2: Ingestion Pipeline (Azure Function) ← CURRENT
+### Phase 2: Ingestion Pipeline (Azure Function) ✓ COMPLETE
 - [x] Align codebase with Azure SQL architecture (remove PostgreSQL code)
 - [x] Blob trigger function scaffold
 - [x] PDF text extraction (PyMuPDF)
 - [x] Chunking strategy (page-based + size-based with overlap)
-- [ ] Explore parsed document structure (upload test PDF)
-- [ ] Define SQL Graph schema based on parsing results
-- [ ] Store sources + chunks in Azure SQL
+- [x] SQL Graph schema (sources, chunks, concepts as NODE; edges for relationships)
+- [x] Database storage with idempotency (delete-and-replace pattern)
+- [x] Graph edges (from_source) linking chunks to sources
 
-### Phase 3: Concept Extraction & Graph
+### Phase 3: Concept Extraction & Graph ← CURRENT
 - [ ] Claude API integration for concept extraction
 - [ ] Concept extraction prompt design
 - [ ] Upsert concepts to SQL Graph nodes
@@ -272,18 +272,19 @@ second-brain/
 
 ---
 
-## Current Phase: 2 - Ingestion Pipeline
+## Current Phase: 3 - Concept Extraction & Graph
 
 ### Detailed Tasks
-1. ~~Set up blob trigger function scaffold~~ ✓
-2. ~~Implement PDF parsing with PyMuPDF~~ ✓
-3. ~~Build chunking logic (page-based + size-based)~~ ✓
-4. Upload test PDF to explore parsed structure
-5. Define SQL Graph schema based on actual parsing results
-6. Store sources + chunks in Azure SQL
-7. Test end-to-end with sample document
+1. Design concept extraction prompt for Claude API
+2. Implement Claude API client with retry logic
+3. Extract concepts from each chunk (name, description, category)
+4. Upsert concepts to `concepts` NODE table
+5. Create `covers` edges (source → concept)
+6. Create `mentions` edges (chunk → concept)
+7. Identify related concepts and create `related_to` edges
+8. Test graph queries with MATCH syntax
 
-**Approach**: Parse documents first, then design schema based on actual data structure needs.
+**Approach**: Process chunks in batches to respect rate limits. Use structured output for reliable parsing.
 
 ### Azure Resources (Phase 1 Complete)
 
@@ -370,43 +371,58 @@ streamlit run app/views/main.py
 ### Node Tables (Azure SQL Graph)
 
 ```sql
--- Sources: PDFs, markdown files, articles, etc.
+-- Sources: PDFs, markdown files, articles
+-- Includes status tracking for processing lifecycle
 CREATE TABLE sources (
-    id INT PRIMARY KEY IDENTITY,
-    title NVARCHAR(255),
-    source_type NVARCHAR(50),      -- 'book', 'markdown', 'article'
-    author NVARCHAR(255) NULL,
-    file_path NVARCHAR(500),
-    metadata NVARCHAR(MAX),        -- JSON for type-specific fields
-    created_at DATETIME2 DEFAULT GETDATE()
+    id INT PRIMARY KEY IDENTITY(1,1),
+    title NVARCHAR(500),
+    author NVARCHAR(255),
+    source_type NVARCHAR(50) NOT NULL,    -- 'pdf', 'markdown', 'article'
+    file_path NVARCHAR(500) NOT NULL,     -- Unique key for idempotency
+    page_count INT,
+    status NVARCHAR(50) NOT NULL,         -- UPLOADED, PARSING, PARSED, EXTRACTING, COMPLETE, *_FAILED
+    error_message NVARCHAR(MAX),
+    metadata NVARCHAR(MAX),               -- JSON
+    created_at DATETIME2, updated_at DATETIME2
 ) AS NODE;
 
 -- Chunks: text segments from sources
 CREATE TABLE chunks (
-    id INT PRIMARY KEY IDENTITY,
-    source_id INT,
-    section NVARCHAR(255),         -- chapter, heading, etc.
-    text NVARCHAR(MAX),
-    position INT,                  -- ordering within source
-    metadata NVARCHAR(MAX)         -- page numbers, line numbers, etc.
+    id INT PRIMARY KEY IDENTITY(1,1),
+    source_id INT NOT NULL,               -- FK to sources
+    text NVARCHAR(MAX) NOT NULL,
+    position INT NOT NULL,                -- Sequential within source
+    page_start INT, page_end INT,
+    section NVARCHAR(500),                -- Heading or chapter
+    char_count INT NOT NULL,              -- For cost tracking
+    metadata NVARCHAR(MAX)
 ) AS NODE;
 
--- Concepts: extracted topics and ideas
+-- Concepts: extracted topics and ideas (Phase 3)
 CREATE TABLE concepts (
-    id INT PRIMARY KEY IDENTITY,
-    name NVARCHAR(255),
+    id INT PRIMARY KEY IDENTITY(1,1),
+    name NVARCHAR(255) NOT NULL,          -- Unique, case-insensitive
     description NVARCHAR(MAX),
-    category NVARCHAR(100)
+    category NVARCHAR(100)                -- 'methodology', 'principle', 'tool', etc.
 ) AS NODE;
 ```
 
 ### Edge Tables
 
 ```sql
-CREATE TABLE covers AS EDGE;      -- Source covers Concept (with weight)
-CREATE TABLE mentions AS EDGE;    -- Chunk mentions Concept (with relevance)
-CREATE TABLE related_to AS EDGE;  -- Concept related to Concept (with strength)
-CREATE TABLE from_source AS EDGE; -- Chunk from Source
+CREATE TABLE from_source AS EDGE;   -- Chunk → Source (graph traversal)
+CREATE TABLE covers (               -- Source → Concept
+    weight FLOAT,                   -- Relevance (0-1)
+    mention_count INT               -- Frequency
+) AS EDGE;
+CREATE TABLE mentions (             -- Chunk → Concept
+    relevance FLOAT,                -- How central (0-1)
+    context NVARCHAR(500)           -- Surrounding text
+) AS EDGE;
+CREATE TABLE related_to (           -- Concept → Concept
+    relationship_type NVARCHAR(100),-- 'similar_to', 'part_of', 'enables'
+    strength FLOAT
+) AS EDGE;
 ```
 
 ### Example Graph Queries
@@ -456,5 +472,6 @@ WHERE MATCH(c1-(related_to)->c2)
 | 2025-12-31 | 2 | Aligned codebase with Azure SQL architecture: rewrote db connection for pyodbc, removed PostgreSQL/pgvector/OpenAI code, restructured pipeline/ → functions/, created function scaffold with blob trigger, updated all scripts and dependencies. Schema deferred until after parsing exploration. |
 | 2026-01-01 | 2 | Implemented PDF parsing (PyMuPDF) with metadata and heading extraction. Built chunking system (page-based with size fallback, sentence-aware breaks, overlap). Wired blob trigger to parse and chunk PDFs. Ready to test with sample document. |
 | 2026-01-01 | 2 | Added System Behavior section: failure modes, processing states, idempotency, retry patterns, cost controls, observability, invariants, and contracts. Created /project:systems-check command. |
+| 2026-01-01 | 2→3 | Phase 2 complete. Implemented SQL Graph schema (3 NODE tables, 4 EDGE tables) with status tracking, idempotency constraints, and cascade deletes. Created init_db.py script and storage.py module. Schema deployed to Azure SQL via Portal. Moving to Phase 3 (concept extraction). |
 
 ---
