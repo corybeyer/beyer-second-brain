@@ -19,13 +19,16 @@ Azure Blob Storage (PDFs, Markdown)
         ↓
    ┌────┴────┐
    ↓         ↓
-Chunks      Concept Extraction (Claude API)
+Chunks      Embeddings (Azure OpenAI)
    ↓         ↓
    └────┬────┘
         ↓
    Azure SQL Database
    ├── Tables (sources, chunks)
    └── SQL Graph (concepts, relationships)
+        ↓                    ↑
+        └──── Concept Extraction (Azure OpenAI GPT-4o-mini) ────┘
+                    (parallel processing)
         ↓
    Claude API (semantic search + synthesis)
         ↓
@@ -39,10 +42,11 @@ Chunks      Concept Extraction (Claude API)
 2. TRIGGER     → Azure Function (Blob Trigger) fires
 3. PARSE       → Extract text from PDF (PyMuPDF) or read Markdown
 4. CHUNK       → Split into sections (by heading, chapter, or sliding window)
-5. STORE       → Insert source + chunks into Azure SQL
-6. EXTRACT     → Claude extracts concepts from each chunk
-7. BUILD GRAPH → Create nodes and edges in SQL Graph
-8. DONE        → Content searchable via app
+5. EMBED       → Generate embeddings via Azure OpenAI (text-embedding-3-small)
+6. STORE       → Insert source + chunks + embeddings into Azure SQL
+7. EXTRACT     → Azure OpenAI GPT-4o-mini extracts concepts IN PARALLEL
+8. BUILD GRAPH → Create nodes and edges in SQL Graph
+9. DONE        → Content searchable via app
 ```
 
 ---
@@ -55,11 +59,11 @@ This section defines how the system behaves under real conditions—failure mode
 
 | Step | Failure | Impact | Handling |
 |------|---------|--------|----------|
-| Blob Trigger | Function timeout (10 min max) | Large PDF unprocessed | Enforce size limits, log and skip |
+| Blob Trigger | Function timeout (10 min max) | Large PDF unprocessed | Parallel processing handles most books |
 | PDF Parse | Corrupt/encrypted/scanned file | Ingestion fails | Mark source as `failed`, log reason |
 | Chunking | Text too sparse or malformed | Poor chunk quality | Validate minimum text length |
-| Claude API | Rate limit (429) or timeout | Concepts not extracted | Retry with exponential backoff |
-| Claude API | Context too large | Chunk rejected | Split oversized chunks before sending |
+| Azure OpenAI | Rate limit (429) or timeout | Concepts not extracted | Retry with exponential backoff |
+| Azure OpenAI | Context too large | Chunk rejected | Split oversized chunks before sending |
 | SQL Write | Connection drop mid-transaction | Partial data | Wrap in transaction, rollback on failure |
 | SQL Write | Duplicate key | Re-processing conflict | Use upsert patterns (MERGE) |
 
@@ -92,7 +96,8 @@ Same input must produce same result. Critical for retries and reprocessing:
 
 | Operation | Strategy | Max Retries | Backoff | Notes |
 |-----------|----------|-------------|---------|-------|
-| Claude API | Exponential | 3 | 2s, 4s, 8s | Respect `Retry-After` header |
+| Azure OpenAI (concepts) | Exponential | 3 | 2s, 4s, 8s | GPT-4o-mini for extraction |
+| Azure OpenAI (embeddings) | Exponential | 3 | 2s, 4s, 8s | text-embedding-3-small |
 | SQL Connection | Exponential | 3 | 1s, 2s, 4s | Use connection pooling |
 | SQL Transaction | None | 0 | - | Fail fast, log for manual review |
 | Blob Read | Automatic | - | - | Azure handles trigger retries |
@@ -101,12 +106,69 @@ Same input must produce same result. Critical for retries and reprocessing:
 
 | Control | Limit | Rationale |
 |---------|-------|-----------|
-| Max PDF size | 100 MB | Function memory (1.5 GB) and timeout |
-| Max pages per PDF | 1000 | Reasonable book length |
-| Max chunks per source | 500 | Claude API cost per document |
-| Max chunk size | 4000 chars | Claude context efficiency |
-| Daily Claude API budget | $25 | Alert threshold, not hard stop |
-| Max concurrent extractions | 5 | Rate limit protection |
+| Max PDF size | 250 MB | Large textbooks supported |
+| Max pages per PDF | 2500 | Very large textbooks supported |
+| Max chunks per source | 3000 | Large documents with parallel processing |
+| Max chunk size | 4000 chars | LLM context efficiency |
+| Function timeout | 10 minutes | Consumption plan maximum |
+| Max concurrent extractions | 20 | Parallel API calls per document |
+
+**Note**: Limits increased after implementing parallel processing (see below). A 287-page book with 426 chunks now processes in ~4.5 minutes instead of ~18 minutes.
+
+### Parallel Processing (Concept Extraction)
+
+The ingestion pipeline uses parallel processing to extract concepts from chunks. This is necessary because:
+
+1. **The Problem**: A typical book has 400+ chunks. Sequential API calls at ~2.5 seconds each = 17+ minutes. Azure Functions on Consumption plan timeout at 10 minutes maximum.
+
+2. **The Solution**: Use Python's `ThreadPoolExecutor` to make multiple API calls simultaneously. With 20 concurrent workers, a 426-chunk book processes in ~4.5 minutes.
+
+**How It Works (for non-technical readers)**:
+
+Imagine you're reading a book and extracting key concepts. If you do it alone, page by page, it takes a long time. But if you have 20 people each reading different pages simultaneously, the work finishes much faster. That's what parallel processing does—it runs multiple API calls at the same time instead of waiting for each one to finish before starting the next.
+
+**Technical Details**:
+
+```python
+# In functions/shared/graph.py
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+MAX_CONCURRENT_EXTRACTIONS = 20  # 20 parallel API calls
+
+def process_source_concepts(source_id: int, chunks: list["Chunk"]) -> dict:
+    extractions: dict[int, ExtractionResult] = {}  # Store results
+
+    def extract_for_chunk(chunk):
+        """Each worker calls Azure OpenAI for one chunk."""
+        return chunk.id, extract_concepts_from_chunk(chunk.text)
+
+    # Create a pool of 20 workers
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_EXTRACTIONS) as executor:
+        # Submit ALL chunk extractions at once
+        future_to_chunk = {
+            executor.submit(extract_for_chunk, chunk): chunk
+            for chunk in valid_chunks
+        }
+
+        # Collect results as they complete (not in order, but that's fine)
+        for future in as_completed(future_to_chunk):
+            chunk_id, extraction = future.result()
+            extractions[chunk_id] = extraction  # Safe: each chunk has unique ID
+```
+
+**Why 20 concurrent workers?**
+- Azure OpenAI GPT-4o-mini has rate limits (~1000 requests/minute for this deployment)
+- 20 concurrent calls × ~2.5 sec per call = ~480 requests/minute (well under limit)
+- More workers would risk rate limiting; fewer would be slower than necessary
+
+**Two-Phase Design**:
+1. **Phase 1 (Parallel)**: Extract concepts from all chunks simultaneously
+2. **Phase 2 (Sequential)**: Store results to database one at a time (database operations need to be sequential to maintain data integrity)
+
+**Performance Results**:
+| Document | Chunks | Sequential Time | Parallel Time | Speedup |
+|----------|--------|-----------------|---------------|---------|
+| 287-page book | 426 | ~18 minutes | ~4.5 minutes | 4x |
 
 ### Observability
 
@@ -297,18 +359,23 @@ second-brain/
 
 ### Decisions Made
 - **Azure SQL over PostgreSQL**: SQL Graph provides native graph capabilities; no need for Apache AGE workarounds
-- **Claude API for search**: Using Claude for semantic search and synthesis instead of vector embeddings (pgvector)
+- **Azure OpenAI for concept extraction**: Switched from Claude API to GPT-4o-mini via Azure AI Foundry for concept extraction. Faster, cheaper, and uses same managed identity as embeddings
+- **JSON string for embeddings**: Azure SQL VECTOR type not available on Basic tier. Embeddings stored as JSON strings in NVARCHAR(MAX). Can be converted to vector later if needed
+- **Parallel processing for concepts**: ThreadPoolExecutor with 20 workers to stay within function timeout. Extracts concepts in parallel, stores sequentially
+- **10-minute function timeout**: Maximum for Consumption plan. Combined with parallel processing, handles 400+ chunk books
 - **Azure Functions for ingestion**: Blob trigger automatically processes new documents
 - **Generic sources schema**: Supports PDFs, markdown, and future document types via `source_type` field
 - **Option A folder structure**: Separated `functions/` (ingestion) from `app/` (interactive) with `shared/` for common code
 - **MVC for app**: The Streamlit app will follow models/views/controllers pattern
 - **Managed identity for auth**: No connection strings with passwords; Function App uses system-assigned managed identity
 - **Reuse existing SQL server**: Database created on existing SQL server in separate resource group
-- **Defer schema until after parsing**: Parse documents first to understand data structure, then design schema
+- **Delete-and-replace for idempotency**: Re-uploading same file deletes existing data and re-processes completely
 
 ### Architecture Rationale
 - **Why not PostgreSQL?** Azure PostgreSQL doesn't support Apache AGE extension
-- **Why not vector embeddings?** Claude can handle semantic search directly; simpler architecture, one less service
+- **Why Azure OpenAI over Claude for extraction?** Same managed identity auth as embeddings, faster response times, cheaper per-call, JSON response format enforced by API
+- **Why parallel processing?** Sequential API calls for 400+ chunks would timeout. 20 concurrent workers process in ~4.5 minutes vs ~18 minutes
+- **Why store embeddings as JSON?** Azure SQL VECTOR functions not available on Basic tier. JSON works and can be migrated later
 - **Why SQL Graph?** Native to Azure SQL, uses familiar SQL + MATCH syntax, no separate graph database needed
 - **Why managed identity?** More secure than connection strings; automatic credential rotation; Azure-native
 
@@ -348,10 +415,28 @@ streamlit run app/views/main.py
 | Storage | Azure Blob Storage | Hot tier, ~2GB |
 | Database | Azure SQL Database | Basic tier (~$5/month) |
 | Graph | SQL Graph (native) | NODE/EDGE tables, MATCH queries |
-| Ingestion | Azure Functions | Consumption plan, blob trigger |
-| Search & Synthesis | Claude API | Semantic search, concept extraction |
+| Ingestion | Azure Functions | Consumption plan, blob trigger, Python v2 model |
+| Embeddings | Azure OpenAI (text-embedding-3-small) | 1536 dimensions, stored as JSON in SQL |
+| Concept Extraction | Azure OpenAI (GPT-4o-mini) | Parallel processing, managed identity auth |
+| Search & Synthesis | Claude API (future) | Semantic search for Streamlit app |
 | App | Streamlit | Python-native |
 | Hosting | Azure Container Apps | Free tier |
+
+### Azure AI Foundry Configuration
+
+The project uses Azure AI Foundry for both embeddings and concept extraction:
+
+| Deployment | Model | Purpose |
+|------------|-------|---------|
+| `text-embedding-3-small` | text-embedding-3-small | Generate embeddings for chunks |
+| `gpt-4o-mini` | GPT-4o-mini | Extract concepts and relationships |
+
+**Authentication**: Managed identity (DefaultAzureCredential) - no API keys needed.
+
+**Environment Variables**:
+- `AZURE_OPENAI_ENDPOINT` - Azure AI Foundry endpoint URL
+- `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` - Deployment name for embeddings
+- `AZURE_OPENAI_COMPLETION_DEPLOYMENT` - Deployment name for GPT-4o-mini
 
 ### Estimated Monthly Cost
 | Service | Cost |
@@ -359,9 +444,10 @@ streamlit run app/views/main.py
 | Azure Blob Storage | ~$0.50 |
 | Azure SQL Database (Basic) | ~$5.00 |
 | Azure Functions (Consumption) | ~$0.00 (free tier) |
+| Azure OpenAI (embeddings) | ~$0.50 (usage-based) |
+| Azure OpenAI (GPT-4o-mini) | ~$2-5 (usage-based) |
 | Azure Container Apps | ~$0.00 (free tier) |
-| Claude API | Usage-based |
-| **Total Azure** | **~$5-6/month** |
+| **Total Azure** | **~$8-11/month** |
 
 ---
 
@@ -473,5 +559,9 @@ WHERE MATCH(c1-(related_to)->c2)
 | 2026-01-01 | 2 | Added System Behavior section: failure modes, processing states, idempotency, retry patterns, cost controls, observability, invariants, and contracts. Created /project:systems-check command. |
 | 2026-01-01 | 2→3 | Phase 2 complete. Implemented SQL Graph schema (3 NODE tables, 4 EDGE tables) with status tracking, idempotency constraints, and cascade deletes. Created init_db.py script and storage.py module. Schema deployed to Azure SQL via Portal. Moving to Phase 3 (concept extraction). |
 | 2026-01-01 | 3→4 | Phase 3 complete. Implemented embeddings.py (OpenAI text-embedding-3-small), concepts.py (Claude extraction with retry logic), graph.py (concept storage, mentions/related_to edges). Updated function_app.py with full pipeline (parse → chunk → embed → store → extract). Added background scripts for cross-source and embedding similarity passes. Ready for Phase 4 (Streamlit app). |
+| 2026-01-02 | 3 | Fixed vector storage: Azure SQL VECTOR type not available on Basic tier. Changed to store embeddings as JSON strings in NVARCHAR(MAX). |
+| 2026-01-02 | 3 | Switched concept extraction from Claude API to Azure OpenAI GPT-4o-mini. Uses same managed identity as embeddings. Added `AZURE_OPENAI_COMPLETION_DEPLOYMENT` environment variable. |
+| 2026-01-02 | 3 | Implemented parallel processing for concept extraction. Uses ThreadPoolExecutor with 20 workers. 287-page book (426 chunks) now processes in ~4.5 minutes instead of ~18 minutes. Increased function timeout to 10 minutes (Consumption plan max). |
+| 2026-01-02 | 3 | Increased limits for large textbooks: 250 MB file size, 2500 pages, 3000 chunks. Successfully processed first book: 2,204 concepts and 4,943 relationships extracted. |
 
 ---
