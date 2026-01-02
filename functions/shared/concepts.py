@@ -1,7 +1,13 @@
-"""Claude API integration for concept extraction.
+"""Azure OpenAI integration for concept extraction.
 
-Extracts concepts and relationships from text chunks using Claude.
+Extracts concepts and relationships from text chunks using GPT-4o-mini.
+Uses Azure AI Foundry with managed identity (same as embeddings).
 Implements structured output parsing with retry logic.
+
+Configuration:
+    AZURE_OPENAI_ENDPOINT - Your Azure AI Foundry endpoint
+    AZURE_OPENAI_COMPLETION_DEPLOYMENT - Deployment name for GPT-4o-mini
+    (Uses managed identity by default, or AZURE_OPENAI_API_KEY if set)
 """
 
 import json
@@ -9,28 +15,98 @@ import os
 import time
 from typing import TypedDict
 
-import anthropic
-from anthropic import RateLimitError, APIError
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+from openai import AzureOpenAI, RateLimitError, APIError
 
 from .logging_utils import structured_logger
 
 # Model configuration
-EXTRACTION_MODEL = "claude-sonnet-4-20250514"
+EXTRACTION_MODEL = "gpt-4o-mini"
 MAX_TOKENS = 1024
 
 # Initialize client lazily
-_client: anthropic.Anthropic | None = None
+_client: AzureOpenAI | None = None
+_deployment_name: str | None = None
 
 
-def _get_client() -> anthropic.Anthropic:
-    """Get or create Anthropic client."""
-    global _client
-    if _client is None:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY environment variable not set")
-        _client = anthropic.Anthropic(api_key=api_key)
+def _get_client() -> AzureOpenAI:
+    """Get or create Azure OpenAI client.
+
+    Uses managed identity for authentication (same as embeddings).
+    """
+    global _client, _deployment_name
+
+    if _client is not None:
+        return _client
+
+    azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    azure_key = os.environ.get("AZURE_OPENAI_API_KEY")
+    azure_deployment = os.environ.get("AZURE_OPENAI_COMPLETION_DEPLOYMENT")
+
+    if not azure_endpoint:
+        raise ValueError("AZURE_OPENAI_ENDPOINT environment variable not set")
+
+    if not azure_deployment:
+        raise ValueError(
+            "AZURE_OPENAI_COMPLETION_DEPLOYMENT environment variable not set. "
+            "Create a GPT-4o-mini deployment in Azure AI Foundry."
+        )
+
+    if azure_key:
+        # Use API key if provided
+        structured_logger.info(
+            "concepts",
+            "Using Azure OpenAI with API key",
+            endpoint=azure_endpoint[:50] + "...",
+        )
+        _client = AzureOpenAI(
+            azure_endpoint=azure_endpoint,
+            api_key=azure_key,
+            api_version="2024-02-01",
+        )
+    else:
+        # Use managed identity (DefaultAzureCredential)
+        structured_logger.info(
+            "concepts",
+            "Using Azure OpenAI with managed identity",
+            endpoint=azure_endpoint[:50] + "...",
+        )
+        token_provider = get_bearer_token_provider(
+            DefaultAzureCredential(),
+            "https://cognitiveservices.azure.com/.default"
+        )
+        _client = AzureOpenAI(
+            azure_endpoint=azure_endpoint,
+            azure_ad_token_provider=token_provider,
+            api_version="2024-02-01",
+        )
+
+    _deployment_name = azure_deployment
     return _client
+
+
+def _get_model_name() -> str:
+    """Get the deployment name for API calls."""
+    global _deployment_name
+    if _deployment_name is None:
+        _get_client()  # Initialize client and deployment name
+    return _deployment_name or EXTRACTION_MODEL
+
+
+def _strip_markdown_json(text: str) -> str:
+    """Strip markdown code block wrapper from JSON response.
+
+    LLMs sometimes return JSON wrapped in ```json ... ``` blocks.
+    This function extracts the raw JSON for parsing.
+    """
+    text = text.strip()
+    if text.startswith("```json"):
+        text = text[7:]  # Remove ```json
+    elif text.startswith("```"):
+        text = text[3:]  # Remove ```
+    if text.endswith("```"):
+        text = text[:-3]  # Remove trailing ```
+    return text.strip()
 
 
 # Concept extraction prompt
@@ -118,19 +194,21 @@ def extract_concepts_from_chunk(
         json.JSONDecodeError: If response is not valid JSON
     """
     client = _get_client()
+    model = _get_model_name()
     prompt = EXTRACTION_PROMPT.format(text=text)
 
     for attempt in range(max_retries):
         try:
-            response = client.messages.create(
-                model=EXTRACTION_MODEL,
+            response = client.chat.completions.create(
+                model=model,
                 max_tokens=MAX_TOKENS,
                 messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},  # Force JSON output
             )
 
-            # Parse JSON response
-            content = response.content[0].text
-            result = json.loads(content)
+            # Parse JSON response (strip markdown wrapper if present)
+            content = response.choices[0].message.content
+            result = json.loads(_strip_markdown_json(content))
 
             # Normalize the relationships key (from → from_concept)
             relationships: list[Relationship] = []
@@ -239,6 +317,7 @@ def find_source_relationships(
         return []
 
     client = _get_client()
+    model = _get_model_name()
 
     # Format concepts for prompt
     concepts_list = "\n".join([
@@ -250,14 +329,14 @@ def find_source_relationships(
 
     for attempt in range(max_retries):
         try:
-            response = client.messages.create(
-                model=EXTRACTION_MODEL,
+            response = client.chat.completions.create(
+                model=model,
                 max_tokens=2048,
                 messages=[{"role": "user", "content": prompt}],
             )
 
-            content = response.content[0].text
-            raw_relationships = json.loads(content)
+            content = response.choices[0].message.content
+            raw_relationships = json.loads(_strip_markdown_json(content))
 
             # Normalize to Relationship type
             relationships: list[Relationship] = []
