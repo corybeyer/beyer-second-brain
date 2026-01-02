@@ -2,8 +2,10 @@
 
 Stores extracted concepts and edges in Azure SQL Graph tables.
 Handles upserts, mentions edges, and relationship edges.
+Uses parallel processing for concept extraction to handle large documents.
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING
 
 from .db.connection import get_db_cursor
@@ -13,6 +15,10 @@ from .logging_utils import structured_logger
 
 if TYPE_CHECKING:
     from .chunker import Chunk
+
+# Max concurrent API calls for concept extraction
+# With 1000 req/min rate limit, 20 concurrent is safe
+MAX_CONCURRENT_EXTRACTIONS = 20
 
 
 def store_chunk_extraction(
@@ -252,12 +258,16 @@ def process_source_concepts(
 ) -> dict:
     """Process all chunks in a source for concept extraction.
 
+    Uses parallel processing to extract concepts from multiple chunks
+    simultaneously, significantly reducing processing time for large documents.
+
     This is the main entry point for Phase 3 processing:
     1. Update source status to EXTRACTING
-    2. Extract concepts from each chunk
-    3. Run source-level relationship pass
-    4. Create covers edges
-    5. Update source status to COMPLETE
+    2. Extract concepts from chunks IN PARALLEL
+    3. Store extractions (sequential for DB consistency)
+    4. Run source-level relationship pass
+    5. Create covers edges
+    6. Update source status to COMPLETE
 
     Args:
         source_id: ID of the source
@@ -275,31 +285,51 @@ def process_source_concepts(
         "errors": 0,
     }
 
-    with get_db_cursor(commit=True) as cursor:
-        # Update status to EXTRACTING
-        cursor.execute(
-            "UPDATE sources SET status = 'EXTRACTING', updated_at = GETDATE() WHERE id = ?",
-            (source_id,),
+    # Filter chunks with valid IDs
+    valid_chunks = [c for c in chunks if c.id is not None]
+    if len(valid_chunks) < len(chunks):
+        structured_logger.warning(
+            "graph",
+            f"Skipping {len(chunks) - len(valid_chunks)} chunks without IDs",
         )
 
-        # Process each chunk
-        for chunk in chunks:
-            if chunk.id is None:
-                structured_logger.warning(
-                    "graph",
-                    "Chunk missing ID, skipping",
-                    position=chunk.position,
-                )
-                continue
+    structured_logger.info(
+        "graph",
+        f"Starting parallel concept extraction for {len(valid_chunks)} chunks",
+        source_id=source_id,
+        max_concurrent=MAX_CONCURRENT_EXTRACTIONS,
+    )
 
+    # === PARALLEL EXTRACTION ===
+    # Extract concepts from all chunks concurrently
+    extractions: dict[int, ExtractionResult] = {}  # chunk_id -> extraction
+
+    def extract_for_chunk(chunk):
+        """Wrapper to extract concepts and return (chunk_id, result)."""
+        return chunk.id, extract_concepts_from_chunk(chunk.text)
+
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_EXTRACTIONS) as executor:
+        # Submit all extraction tasks
+        future_to_chunk = {
+            executor.submit(extract_for_chunk, chunk): chunk
+            for chunk in valid_chunks
+        }
+
+        # Collect results as they complete
+        for future in as_completed(future_to_chunk):
+            chunk = future_to_chunk[future]
             try:
-                extraction = extract_concepts_from_chunk(chunk.text)
-                concepts_count, edges_count = store_chunk_extraction(
-                    cursor, chunk.id, source_id, extraction
-                )
+                chunk_id, extraction = future.result()
+                extractions[chunk_id] = extraction
                 stats["chunks_processed"] += 1
-                stats["concepts_extracted"] += concepts_count
-                stats["relationships_created"] += edges_count
+
+                # Log progress every 50 chunks
+                if stats["chunks_processed"] % 50 == 0:
+                    structured_logger.info(
+                        "graph",
+                        f"Extracted concepts from {stats['chunks_processed']}/{len(valid_chunks)} chunks",
+                        source_id=source_id,
+                    )
 
             except Exception as e:
                 structured_logger.warning(
@@ -309,7 +339,36 @@ def process_source_concepts(
                     error_type=type(e).__name__,
                 )
                 stats["errors"] += 1
-                continue
+
+    structured_logger.info(
+        "graph",
+        f"Parallel extraction complete: {len(extractions)} successful, {stats['errors']} errors",
+        source_id=source_id,
+    )
+
+    # === SEQUENTIAL STORAGE ===
+    # Store extractions in database (sequential for consistency)
+    with get_db_cursor(commit=True) as cursor:
+        # Update status to EXTRACTING
+        cursor.execute(
+            "UPDATE sources SET status = 'EXTRACTING', updated_at = GETDATE() WHERE id = ?",
+            (source_id,),
+        )
+
+        # Store each extraction
+        for chunk_id, extraction in extractions.items():
+            try:
+                concepts_count, edges_count = store_chunk_extraction(
+                    cursor, chunk_id, source_id, extraction
+                )
+                stats["concepts_extracted"] += concepts_count
+                stats["relationships_created"] += edges_count
+            except Exception as e:
+                structured_logger.warning(
+                    "graph",
+                    f"Failed to store extraction: {e}",
+                    chunk_id=chunk_id,
+                )
 
         # Source-level relationship pass
         try:
