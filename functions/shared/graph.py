@@ -119,6 +119,29 @@ def store_chunk_extraction(
     return concepts_created, edges_created
 
 
+def store_chunk_extraction_standalone(
+    source_id: int,
+    chunk: "Chunk",
+    extraction: ExtractionResult,
+) -> tuple[int, int]:
+    """Store extracted concepts with its own transaction.
+
+    This is a wrapper around store_chunk_extraction that manages
+    its own database cursor. Used by the timer function for
+    individual chunk processing.
+
+    Args:
+        source_id: ID of the source document
+        chunk: Chunk object with id and text
+        extraction: Concepts and relationships from extraction
+
+    Returns:
+        Tuple of (concepts_created, edges_created)
+    """
+    with get_db_cursor(commit=True) as cursor:
+        return store_chunk_extraction(cursor, chunk.id, source_id, extraction)
+
+
 def source_level_relationship_pass(cursor, source_id: int) -> int:
     """Find relationships between all concepts in a source.
 

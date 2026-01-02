@@ -48,6 +48,7 @@ CREATE TABLE sources (
 
 -- Chunks: text segments from sources
 -- Position is sequential within each source (invariant)
+-- Processing status tracked per-chunk for resumable processing
 CREATE TABLE chunks (
     id INT PRIMARY KEY IDENTITY(1,1),
     source_id INT NOT NULL,
@@ -57,13 +58,19 @@ CREATE TABLE chunks (
     page_end INT,
     section NVARCHAR(500),              -- Heading or chapter name
     char_count INT NOT NULL,            -- For cost tracking
-    embedding VECTOR(1536),             -- OpenAI text-embedding-3-small
+    embedding NVARCHAR(MAX),            -- OpenAI text-embedding-3-small (JSON string)
+    embedding_status NVARCHAR(20) NOT NULL DEFAULT 'PENDING',  -- PENDING, COMPLETE, FAILED
+    concept_status NVARCHAR(20) NOT NULL DEFAULT 'PENDING',    -- PENDING, EXTRACTED, FAILED
+    extraction_error NVARCHAR(500),     -- Error message if extraction failed
+    extraction_attempts INT NOT NULL DEFAULT 0,  -- Retry counter
     metadata NVARCHAR(MAX),             -- JSON for additional fields
     created_at DATETIME2 NOT NULL DEFAULT GETDATE(),
     CONSTRAINT FK_chunks_source FOREIGN KEY (source_id)
         REFERENCES sources(id) ON DELETE CASCADE,
     CONSTRAINT UQ_chunks_position UNIQUE (source_id, position),
-    CONSTRAINT CK_chunks_text_not_empty CHECK (LEN(text) > 0)
+    CONSTRAINT CK_chunks_text_not_empty CHECK (LEN(text) > 0),
+    CONSTRAINT CK_chunks_embedding_status CHECK (embedding_status IN ('PENDING', 'COMPLETE', 'FAILED')),
+    CONSTRAINT CK_chunks_concept_status CHECK (concept_status IN ('PENDING', 'EXTRACTED', 'FAILED'))
 ) AS NODE;
 
 -- Concepts: extracted topics and ideas (Phase 3)
@@ -123,6 +130,14 @@ CREATE INDEX IX_sources_type ON sources(source_type);
 -- Chunks: query by source for retrieval
 CREATE INDEX IX_chunks_source ON chunks(source_id);
 
+-- Chunks: query pending embeddings for timer function
+CREATE INDEX IX_chunks_embedding_status ON chunks(embedding_status)
+    WHERE embedding_status = 'PENDING';
+
+-- Chunks: query pending concept extraction for timer function
+CREATE INDEX IX_chunks_concept_status ON chunks(concept_status)
+    WHERE concept_status = 'PENDING';
+
 -- Concepts: query by category for browsing
 CREATE INDEX IX_concepts_category ON concepts(category);
 """
@@ -147,4 +162,76 @@ SELECT COUNT(*)
 FROM INFORMATION_SCHEMA.TABLES
 WHERE TABLE_SCHEMA = 'dbo'
   AND TABLE_NAME IN ('sources', 'chunks', 'concepts');
+"""
+
+# Migration: Add chunk processing status columns (for existing databases)
+# Run this if database already has data and you don't want to reset
+MIGRATION_ADD_CHUNK_STATUS_SQL = """
+-- Add processing status columns to chunks table
+-- These columns enable resumable processing via timer function
+
+-- Check if columns exist before adding (idempotent migration)
+IF NOT EXISTS (
+    SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_NAME = 'chunks' AND COLUMN_NAME = 'embedding_status'
+)
+BEGIN
+    ALTER TABLE chunks ADD embedding_status NVARCHAR(20) NOT NULL DEFAULT 'PENDING';
+    ALTER TABLE chunks ADD CONSTRAINT CK_chunks_embedding_status
+        CHECK (embedding_status IN ('PENDING', 'COMPLETE', 'FAILED'));
+END;
+
+IF NOT EXISTS (
+    SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_NAME = 'chunks' AND COLUMN_NAME = 'concept_status'
+)
+BEGIN
+    ALTER TABLE chunks ADD concept_status NVARCHAR(20) NOT NULL DEFAULT 'PENDING';
+    ALTER TABLE chunks ADD CONSTRAINT CK_chunks_concept_status
+        CHECK (concept_status IN ('PENDING', 'EXTRACTED', 'FAILED'));
+END;
+
+IF NOT EXISTS (
+    SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_NAME = 'chunks' AND COLUMN_NAME = 'extraction_error'
+)
+BEGIN
+    ALTER TABLE chunks ADD extraction_error NVARCHAR(500) NULL;
+END;
+
+IF NOT EXISTS (
+    SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_NAME = 'chunks' AND COLUMN_NAME = 'extraction_attempts'
+)
+BEGIN
+    ALTER TABLE chunks ADD extraction_attempts INT NOT NULL DEFAULT 0;
+END;
+
+-- Add filtered indexes for efficient pending chunk queries
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes WHERE name = 'IX_chunks_embedding_status'
+)
+BEGIN
+    CREATE INDEX IX_chunks_embedding_status ON chunks(embedding_status)
+        WHERE embedding_status = 'PENDING';
+END;
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes WHERE name = 'IX_chunks_concept_status'
+)
+BEGIN
+    CREATE INDEX IX_chunks_concept_status ON chunks(concept_status)
+        WHERE concept_status = 'PENDING';
+END;
+
+-- Mark existing chunks with embeddings as COMPLETE
+UPDATE chunks SET embedding_status = 'COMPLETE' WHERE embedding IS NOT NULL;
+
+-- Mark existing chunks that have concepts extracted as EXTRACTED
+-- (chunks that have mentions edges)
+UPDATE c SET c.concept_status = 'EXTRACTED'
+FROM chunks c
+WHERE EXISTS (
+    SELECT 1 FROM mentions m WHERE m.$from_id = c.$node_id
+);
 """

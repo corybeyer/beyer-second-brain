@@ -13,41 +13,57 @@ Build a personal knowledge system that ingests documents (PDFs, markdown) on dat
 ```
 Azure Blob Storage (PDFs, Markdown)
         ↓
-   Azure Function (Blob Trigger)
-        ↓
-   PDF Parser / MD Reader + Chunker
-        ↓
-   ┌────┴────┐
-   ↓         ↓
-Chunks      Embeddings (Azure OpenAI)
-   ↓         ↓
-   └────┬────┘
-        ↓
-   Azure SQL Database
-   ├── Tables (sources, chunks)
-   └── SQL Graph (concepts, relationships)
-        ↓                    ↑
-        └──── Concept Extraction (Azure OpenAI GPT-4o-mini) ────┘
-                    (parallel processing)
+   Azure Function (Blob Trigger) ─────────────────┐
+        ↓                                          │
+   PDF Parser / MD Reader + Chunker                │ Fast path
+        ↓                                          │ (always completes)
+   Azure SQL Database                              │
+   ├── Tables (sources, chunks with PENDING status)│
+        ↓                                      ────┘
+   Azure Function (Timer Trigger, every 5 min)─────┐
+        ↓                                          │
+   ┌────┴────┐                                     │ Self-healing
+   ↓         ↓                                     │ (resumable)
+Embeddings  Concept Extraction                     │
+(Azure OpenAI) (GPT-4o-mini)                       │
+   ↓         ↓                                     │
+   └────┬────┘                                     │
+        ↓                                          │
+   Update chunks & SQL Graph                   ────┘
         ↓
    Claude API (semantic search + synthesis)
         ↓
    Streamlit App (Azure Container Apps)
 ```
 
-### Ingestion Workflow
+### Ingestion Workflow (Two-Phase Architecture)
 
+**Phase 1: Blob Trigger (fast, always completes)**
 ```
 1. UPLOAD      → PDF/MD lands in Azure Blob Storage
 2. TRIGGER     → Azure Function (Blob Trigger) fires
 3. PARSE       → Extract text from PDF (PyMuPDF) or read Markdown
 4. CHUNK       → Split into sections (by heading, chapter, or sliding window)
-5. EMBED       → Generate embeddings via Azure OpenAI (text-embedding-3-small)
-6. STORE       → Insert source + chunks + embeddings into Azure SQL
-7. EXTRACT     → Azure OpenAI GPT-4o-mini extracts concepts IN PARALLEL
-8. BUILD GRAPH → Create nodes and edges in SQL Graph
-9. DONE        → Content searchable via app
+5. STORE       → Insert source + chunks into Azure SQL
+                 (embedding_status=PENDING, concept_status=PENDING)
+6. DONE        → Blob trigger exits, chunks queued for processing
 ```
+
+**Phase 2: Timer Trigger (self-healing, resumable)**
+```
+1. CHECK       → Timer fires every 5 min, checks for pending work
+2. EARLY EXIT  → If nothing pending, exit immediately (minimal cost)
+3. EMBED       → Generate embeddings for PENDING chunks (batch of 500)
+4. EXTRACT     → Extract concepts for chunks with complete embeddings (batch of 200)
+5. UPDATE      → Mark chunks as COMPLETE/EXTRACTED, update source status
+6. REPEAT      → Next timer invocation continues where this left off
+```
+
+**Why Two Phases?**
+- Large documents (800+ pages) would timeout in a single function execution
+- Timer function is self-healing: if it times out, next run continues from checkpoint
+- Any size document eventually completes across multiple timer invocations
+- Minimal cost when idle: early exit if no pending work
 
 ---
 
@@ -59,27 +75,33 @@ This section defines how the system behaves under real conditions—failure mode
 
 | Step | Failure | Impact | Handling |
 |------|---------|--------|----------|
-| Blob Trigger | Function timeout (10 min max) | Large PDF unprocessed | Parallel processing handles most books |
+| Blob Trigger | Function timeout (10 min max) | N/A | Blob trigger only parses/chunks, always completes |
 | PDF Parse | Corrupt/encrypted/scanned file | Ingestion fails | Mark source as `failed`, log reason |
 | Chunking | Text too sparse or malformed | Poor chunk quality | Validate minimum text length |
-| Azure OpenAI | Rate limit (429) or timeout | Concepts not extracted | Retry with exponential backoff |
+| Timer Trigger | Function timeout (10 min max) | Partial batch | Next timer run continues from checkpoint |
+| Azure OpenAI | Rate limit (429) or timeout | Chunk not processed | Mark chunk FAILED, retry next timer run |
 | Azure OpenAI | Context too large | Chunk rejected | Split oversized chunks before sending |
 | SQL Write | Connection drop mid-transaction | Partial data | Wrap in transaction, rollback on failure |
 | SQL Write | Duplicate key | Re-processing conflict | Use upsert patterns (MERGE) |
 
 ### Processing States
 
-Track document lifecycle to enable recovery and prevent duplicate work:
-
+**Source-level states** (document lifecycle):
 ```
-UPLOADED → PARSING → PARSED → EXTRACTING → COMPLETE
-              ↓                    ↓
-           PARSE_FAILED      EXTRACT_FAILED
+UPLOADED → PARSING → PARSED → COMPLETE
+              ↓
+           PARSE_FAILED
 ```
 
-- Add `status` and `error_message` columns to sources table
-- Query by status to find stuck/failed documents
-- Enable manual retry of failed documents
+**Chunk-level states** (processing tracking):
+```
+embedding_status: PENDING → COMPLETE | FAILED
+concept_status:   PENDING → EXTRACTED | FAILED
+```
+
+- Source moves to COMPLETE when all chunks have embedding_status=COMPLETE and concept_status=EXTRACTED
+- Chunks track `extraction_attempts` counter (max 3 retries before marking FAILED)
+- Timer function queries chunks by status to find pending work
 
 ### Idempotency
 
@@ -113,62 +135,59 @@ Same input must produce same result. Critical for retries and reprocessing:
 | Function timeout | 10 minutes | Consumption plan maximum |
 | Max concurrent extractions | 20 | Parallel API calls per document |
 
-**Note**: Limits increased after implementing parallel processing (see below). A 287-page book with 426 chunks now processes in ~4.5 minutes instead of ~18 minutes.
+**Note**: Very large documents (800+ pages, 1500+ chunks) are handled by the timer function, which processes chunks across multiple invocations.
 
-### Parallel Processing (Concept Extraction)
+### Timer-Based Processing (Resumable)
 
-The ingestion pipeline uses parallel processing to extract concepts from chunks. This is necessary because:
+The timer function processes embeddings and concept extraction in batches, enabling any size document to complete:
 
-1. **The Problem**: A typical book has 400+ chunks. Sequential API calls at ~2.5 seconds each = 17+ minutes. Azure Functions on Consumption plan timeout at 10 minutes maximum.
+1. **The Problem**: An 850-page book has 1787 chunks. Even with parallel processing, this would take ~15 minutes. Azure Functions on Consumption plan timeout at 10 minutes.
 
-2. **The Solution**: Use Python's `ThreadPoolExecutor` to make multiple API calls simultaneously. With 20 concurrent workers, a 426-chunk book processes in ~4.5 minutes.
+2. **The Solution**: Decouple heavy processing from the blob trigger. Store chunks with PENDING status, then process in batches via a timer function that runs every 5 minutes.
 
 **How It Works (for non-technical readers)**:
 
-Imagine you're reading a book and extracting key concepts. If you do it alone, page by page, it takes a long time. But if you have 20 people each reading different pages simultaneously, the work finishes much faster. That's what parallel processing does—it runs multiple API calls at the same time instead of waiting for each one to finish before starting the next.
+Think of it like a mail sorting facility. When a truck arrives (document uploaded), workers quickly unload and label the packages (parse and chunk). Then, throughout the day, other workers process the packages in shifts (timer function). If a shift ends, the next shift picks up where they left off. No package is ever lost or processed twice.
 
 **Technical Details**:
 
 ```python
-# In functions/shared/graph.py
-from concurrent.futures import ThreadPoolExecutor, as_completed
+# Timer function runs every 5 minutes
+@app.timer_trigger(schedule="0 */5 * * * *")
+def process_pending_chunks(timer):
+    # 1. Early exit if no work
+    stats = get_processing_stats()
+    if stats["pending_embeddings"] == 0 and stats["pending_concepts"] == 0:
+        return  # Exit immediately, minimal cost
 
-MAX_CONCURRENT_EXTRACTIONS = 20  # 20 parallel API calls
+    # 2. Process embeddings batch (500 chunks)
+    for chunk in get_pending_embedding_chunks(limit=500):
+        embedding = get_embedding(chunk["text"])
+        update_chunk_embedding(chunk["id"], embedding)
 
-def process_source_concepts(source_id: int, chunks: list["Chunk"]) -> dict:
-    extractions: dict[int, ExtractionResult] = {}  # Store results
+    # 3. Process concept extraction batch (200 chunks)
+    for chunk in get_pending_concept_chunks(limit=200):
+        extraction = extract_concepts_from_chunk(chunk["text"])
+        store_chunk_extraction_standalone(...)
+        update_chunk_concept_status(chunk["id"], "EXTRACTED")
 
-    def extract_for_chunk(chunk):
-        """Each worker calls Azure OpenAI for one chunk."""
-        return chunk.id, extract_concepts_from_chunk(chunk.text)
-
-    # Create a pool of 20 workers
-    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_EXTRACTIONS) as executor:
-        # Submit ALL chunk extractions at once
-        future_to_chunk = {
-            executor.submit(extract_for_chunk, chunk): chunk
-            for chunk in valid_chunks
-        }
-
-        # Collect results as they complete (not in order, but that's fine)
-        for future in as_completed(future_to_chunk):
-            chunk_id, extraction = future.result()
-            extractions[chunk_id] = extraction  # Safe: each chunk has unique ID
+    # 4. Check if any sources are now complete
+    for source_id in processed_source_ids:
+        if check_source_complete(source_id):
+            update_source_status(source_id, "COMPLETE")
 ```
 
-**Why 20 concurrent workers?**
-- Azure OpenAI GPT-4o-mini has rate limits (~1000 requests/minute for this deployment)
-- 20 concurrent calls × ~2.5 sec per call = ~480 requests/minute (well under limit)
-- More workers would risk rate limiting; fewer would be slower than necessary
-
-**Two-Phase Design**:
-1. **Phase 1 (Parallel)**: Extract concepts from all chunks simultaneously
-2. **Phase 2 (Sequential)**: Store results to database one at a time (database operations need to be sequential to maintain data integrity)
+**Why This Approach?**
+- **Self-healing**: If timer times out, next run continues from checkpoint
+- **No size limit**: 1787 chunks? Just takes 4-5 timer invocations
+- **Low idle cost**: Early exit when nothing to process (~100ms check)
+- **Simpler blob trigger**: Parse/chunk/store only, always completes
 
 **Performance Results**:
-| Document | Chunks | Sequential Time | Parallel Time | Speedup |
-|----------|--------|-----------------|---------------|---------|
-| 287-page book | 426 | ~18 minutes | ~4.5 minutes | 4x |
+| Document | Chunks | Old Approach | New Approach | Notes |
+|----------|--------|--------------|--------------|-------|
+| 287-page book | 426 | ~5 min (parallel) | ~10 min (2 timer runs) | Works |
+| 850-page book | 1787 | TIMEOUT | ~25 min (5 timer runs) | Now works! |
 
 ### Observability
 
@@ -563,5 +582,6 @@ WHERE MATCH(c1-(related_to)->c2)
 | 2026-01-02 | 3 | Switched concept extraction from Claude API to Azure OpenAI GPT-4o-mini. Uses same managed identity as embeddings. Added `AZURE_OPENAI_COMPLETION_DEPLOYMENT` environment variable. |
 | 2026-01-02 | 3 | Implemented parallel processing for concept extraction. Uses ThreadPoolExecutor with 20 workers. 287-page book (426 chunks) now processes in ~4.5 minutes instead of ~18 minutes. Increased function timeout to 10 minutes (Consumption plan max). |
 | 2026-01-02 | 3 | Increased limits for large textbooks: 250 MB file size, 2500 pages, 3000 chunks. Successfully processed first book: 2,204 concepts and 4,943 relationships extracted. |
+| 2026-01-02 | 3 | Architecture change: Two-phase processing. Blob trigger now only parses/chunks/stores (fast, always completes). Timer function (every 5 min) handles embeddings and concept extraction in batches. Chunks track `embedding_status` and `concept_status` for resumable processing. Any size document now completes across multiple timer invocations. Added `--migrate` option to init_db.py for existing databases. |
 
 ---

@@ -5,9 +5,10 @@ Creates Azure SQL Graph tables for sources, chunks, concepts, and relationships.
 Supports both fresh install and reset (drop + recreate).
 
 Usage:
-    python scripts/init_db.py          # Create tables if not exist
-    python scripts/init_db.py --reset  # Drop and recreate all tables
-    python scripts/init_db.py --check  # Check schema status only
+    python scripts/init_db.py            # Create tables if not exist
+    python scripts/init_db.py --reset    # Drop and recreate all tables
+    python scripts/init_db.py --check    # Check schema status only
+    python scripts/init_db.py --migrate  # Add chunk status columns (safe for existing data)
 """
 
 import argparse
@@ -18,7 +19,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from shared.db.connection import get_db_cursor
-from shared.db.models import SCHEMA_SQL, DROP_SCHEMA_SQL, CHECK_SCHEMA_SQL
+from shared.db.models import (
+    SCHEMA_SQL,
+    DROP_SCHEMA_SQL,
+    CHECK_SCHEMA_SQL,
+    MIGRATION_ADD_CHUNK_STATUS_SQL,
+)
 
 
 def check_connection() -> bool:
@@ -141,6 +147,76 @@ def verify_schema() -> bool:
         return False
 
 
+def run_migration() -> bool:
+    """Run migration to add chunk processing status columns.
+
+    This migration is idempotent - safe to run multiple times.
+    It adds embedding_status and concept_status columns to the chunks table,
+    along with indexes for efficient querying by the timer function.
+    """
+    print("Running migration: Add chunk processing status columns...")
+    try:
+        with get_db_cursor(commit=True) as cursor:
+            # Split and execute each statement separately
+            # Azure SQL doesn't support multiple statements with GO in pyodbc
+            statements = []
+            current = []
+
+            for line in MIGRATION_ADD_CHUNK_STATUS_SQL.split("\n"):
+                # Skip pure comment lines
+                if line.strip().startswith("--"):
+                    continue
+                current.append(line)
+                # Split on semicolons, but handle BEGIN...END blocks
+                if line.strip().endswith(";") and "BEGIN" not in "".join(current):
+                    statements.append("\n".join(current))
+                    current = []
+                elif line.strip() == "END;":
+                    statements.append("\n".join(current))
+                    current = []
+
+            for statement in statements:
+                statement = statement.strip()
+                if statement:
+                    try:
+                        cursor.execute(statement)
+                    except Exception as e:
+                        print(f"  Warning: {e}")
+                        # Continue - some statements may fail if already applied
+
+            print("  Migration complete")
+            return True
+    except Exception as e:
+        print(f"  Migration failed: {e}")
+        return False
+
+
+def check_chunk_status_columns() -> bool:
+    """Check if chunk processing status columns exist."""
+    print("Checking for chunk status columns...")
+    try:
+        with get_db_cursor() as cursor:
+            cursor.execute("""
+                SELECT COLUMN_NAME
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_NAME = 'chunks'
+                  AND COLUMN_NAME IN ('embedding_status', 'concept_status')
+            """)
+            columns = [row[0] for row in cursor.fetchall()]
+            if len(columns) == 2:
+                print("  Chunk status columns exist (embedding_status, concept_status)")
+                return True
+            elif len(columns) > 0:
+                print(f"  Partial: only {columns} found")
+                return False
+            else:
+                print("  Chunk status columns not found - run with --migrate")
+                return False
+    except Exception as e:
+        print(f"  Check failed: {e}")
+        return False
+
+
 def main() -> None:
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -155,6 +231,11 @@ def main() -> None:
         "--check",
         action="store_true",
         help="Check schema status only, don't modify",
+    )
+    parser.add_argument(
+        "--migrate",
+        action="store_true",
+        help="Run migrations to add chunk status columns (safe for existing data)",
     )
     args = parser.parse_args()
 
@@ -177,10 +258,25 @@ def main() -> None:
     if args.check:
         if status["complete"]:
             print("Schema is complete and ready.")
+            check_chunk_status_columns()
         elif status["exists"]:
             print("Schema is incomplete. Run without --check to finish setup.")
         else:
             print("No schema found. Run without --check to create.")
+        return
+
+    # Migration mode
+    if args.migrate:
+        if not status["exists"]:
+            print("No schema found. Run without --migrate first to create schema.")
+            return
+        print()
+        if not run_migration():
+            sys.exit(1)
+        print()
+        check_chunk_status_columns()
+        print()
+        print("Done!")
         return
 
     # Reset mode
