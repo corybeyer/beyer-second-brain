@@ -1,6 +1,6 @@
 # Second Brain
 
-A personal knowledge management system for surfacing insights and relationships across a library of data leadership documents (PDFs, markdown).
+A personal knowledge management system for surfacing insights and relationships across a library documents (PDFs, markdown).
 
 ## Project Status
 
