@@ -8,8 +8,13 @@ Implements System Behavior patterns from CLAUDE.md:
 - Structured logging with timing
 - Cost controls
 
-Pipeline steps:
-1. Parse PDF → 2. Chunk → 3. Embed → 4. Store → 5. Extract Concepts
+Architecture:
+- Blob trigger: Parse → Chunk → Store (fast, always completes)
+- Timer trigger: Embed → Extract Concepts (resumable, self-healing)
+
+The blob trigger stores chunks with PENDING status. The timer function
+processes pending chunks in batches, enabling large documents to complete
+across multiple timer invocations.
 """
 
 import logging
@@ -19,16 +24,10 @@ import azure.functions as func
 
 # Lazy imports to avoid startup failures - these are imported inside functions
 # from shared.chunker import chunk_document
-# from shared.embeddings import embed_chunks
-# from shared.graph import process_source_concepts
 # from shared.logging_utils import structured_logger
 # from shared.parser import detect_file_type, parse_pdf
 # from shared.storage import store_document
 # from shared.validation import (...)
-
-# Feature flags for optional pipeline steps
-ENABLE_EMBEDDINGS = os.environ.get("ENABLE_EMBEDDINGS", "true").lower() == "true"
-ENABLE_CONCEPTS = os.environ.get("ENABLE_CONCEPTS", "true").lower() == "true"
 
 app = func.FunctionApp()
 
@@ -110,11 +109,9 @@ def ingest_document(blob: func.InputStream) -> None:
     """
     # Lazy imports to avoid startup failures
     from shared.chunker import chunk_document
-    from shared.embeddings import embed_chunks
-    from shared.graph import process_source_concepts
     from shared.logging_utils import structured_logger
     from shared.parser import detect_file_type, parse_pdf
-    from shared.storage import store_document, update_source_status
+    from shared.storage import store_document
     from shared.validation import (
         ProcessingStatus,
         validate_chunk_count,
@@ -276,27 +273,10 @@ def ingest_document(blob: func.InputStream) -> None:
             structure=structure,
         )
 
-        # === EMBEDDING PHASE (optional) ===
-        if ENABLE_EMBEDDINGS:
-            with structured_logger.timed_operation(
-                "embedding", f"Generating embeddings for {len(chunks)} chunks"
-            ) as ctx:
-                chunks = embed_chunks(chunks)
-                ctx["chunks_embedded"] = len(chunks)
-
-            structured_logger.info(
-                "embedding",
-                "Embeddings generated",
-                chunk_count=len(chunks),
-            )
-        else:
-            structured_logger.info(
-                "embedding",
-                "Embedding generation disabled",
-            )
-
         # === STORAGE PHASE ===
         # Store document and chunks with idempotency (delete-and-replace)
+        # Chunks are stored with embedding_status=PENDING, concept_status=PENDING
+        # The timer function will process these asynchronously
         with structured_logger.timed_operation("store", "Store in database") as ctx:
             source_id = store_document(doc, chunks, filename)
             ctx["source_id"] = source_id
@@ -309,35 +289,11 @@ def ingest_document(blob: func.InputStream) -> None:
             chunk_count=len(chunks),
         )
 
-        # === CONCEPT EXTRACTION PHASE (optional) ===
-        if ENABLE_CONCEPTS:
-            with structured_logger.timed_operation(
-                "concepts", "Extracting concepts"
-            ) as ctx:
-                stats = process_source_concepts(source_id, chunks)
-                ctx["concepts_extracted"] = stats["concepts_extracted"]
-                ctx["relationships_created"] = stats["relationships_created"]
-
-            structured_logger.info(
-                "concepts",
-                "Concept extraction complete",
-                source_id=source_id,
-                stats=stats,
-            )
-        else:
-            structured_logger.info(
-                "concepts",
-                "Concept extraction disabled",
-            )
-            # Update status to COMPLETE if concepts are disabled
-            update_source_status(source_id, "COMPLETE")
-
-        status = ProcessingStatus.COMPLETE
-        status_str = "COMPLETE"
-
+        # Blob trigger complete - timer function will handle embedding and concepts
+        # Source remains in PARSED status until timer completes all chunks
         structured_logger.info(
             "complete",
-            "Pipeline complete",
+            "Blob trigger complete - chunks queued for processing",
             source_id=source_id,
             chunk_count=len(chunks),
             status=status_str,
@@ -355,3 +311,231 @@ def ingest_document(blob: func.InputStream) -> None:
             structured_logger.clear_context()
         except Exception:
             pass  # Ignore if logger wasn't initialized
+
+
+@app.timer_trigger(
+    schedule="0 */5 * * * *",  # Every 5 minutes
+    arg_name="timer",
+    run_on_startup=False,
+)
+def process_pending_chunks(timer: func.TimerRequest) -> None:
+    """Process pending embeddings and concept extraction.
+
+    This timer function runs every 5 minutes to process chunks that need
+    embeddings or concept extraction. It implements the "early exit" pattern:
+    if no work is pending, it exits immediately (minimal cost).
+
+    The function processes work in batches to stay within the 10-minute
+    timeout limit. If it doesn't finish, the next invocation continues
+    where it left off.
+
+    Processing order:
+    1. Generate embeddings for chunks with embedding_status=PENDING
+    2. Extract concepts for chunks with concept_status=PENDING
+       (only after embeddings are complete)
+    3. Update source status to COMPLETE when all chunks are done
+    """
+    import time
+
+    from shared.chunker import Chunk
+    from shared.concepts import extract_concepts_from_chunk
+    from shared.embeddings import get_embedding
+    from shared.graph import store_chunk_extraction_standalone
+    from shared.logging_utils import structured_logger
+    from shared.storage import (
+        check_source_complete,
+        get_pending_concept_chunks,
+        get_pending_embedding_chunks,
+        get_processing_stats,
+        update_chunk_concept_status,
+        update_chunk_embedding,
+        update_chunk_embedding_failed,
+        update_source_status,
+    )
+
+    start_time = time.time()
+    MAX_RUNTIME_SECONDS = 540  # 9 minutes (leave 1 min buffer before 10 min timeout)
+
+    structured_logger.info(
+        "timer",
+        "Timer function started",
+        is_past_due=timer.past_due,
+    )
+
+    # === EARLY EXIT CHECK ===
+    stats = get_processing_stats()
+    pending_embeddings = stats.get("pending_embeddings", 0)
+    pending_concepts = stats.get("pending_concepts", 0)
+
+    if pending_embeddings == 0 and pending_concepts == 0:
+        structured_logger.info(
+            "timer",
+            "No pending work - early exit",
+            stats=stats,
+        )
+        return
+
+    structured_logger.info(
+        "timer",
+        "Pending work found",
+        pending_embeddings=pending_embeddings,
+        pending_concepts=pending_concepts,
+    )
+
+    # Track which sources we process for status updates
+    processed_source_ids: set[int] = set()
+    embeddings_processed = 0
+    concepts_processed = 0
+
+    # === PHASE 1: EMBEDDINGS ===
+    if pending_embeddings > 0:
+        structured_logger.info(
+            "timer",
+            "Starting embedding phase",
+            pending=pending_embeddings,
+        )
+
+        # Get batch of pending chunks
+        pending_chunks = get_pending_embedding_chunks(limit=500)
+
+        for chunk_data in pending_chunks:
+            # Check if we're running out of time
+            elapsed = time.time() - start_time
+            if elapsed > MAX_RUNTIME_SECONDS:
+                structured_logger.info(
+                    "timer",
+                    "Approaching timeout - stopping embedding phase",
+                    elapsed_seconds=elapsed,
+                    embeddings_processed=embeddings_processed,
+                )
+                break
+
+            try:
+                # Generate embedding
+                embedding = get_embedding(chunk_data["text"])
+
+                # Update chunk with embedding
+                update_chunk_embedding(chunk_data["id"], embedding)
+
+                embeddings_processed += 1
+                processed_source_ids.add(chunk_data["source_id"])
+
+                if embeddings_processed % 50 == 0:
+                    structured_logger.info(
+                        "timer",
+                        f"Embedded {embeddings_processed} chunks",
+                        embeddings_processed=embeddings_processed,
+                    )
+
+            except Exception as e:
+                # Mark as failed, will retry up to 3 times
+                update_chunk_embedding_failed(chunk_data["id"], str(e)[:500])
+                structured_logger.warning(
+                    "timer",
+                    f"Embedding failed for chunk {chunk_data['id']}",
+                    error=str(e),
+                )
+
+        structured_logger.info(
+            "timer",
+            "Embedding phase complete",
+            embeddings_processed=embeddings_processed,
+        )
+
+    # === PHASE 2: CONCEPT EXTRACTION ===
+    elapsed = time.time() - start_time
+    if elapsed < MAX_RUNTIME_SECONDS and pending_concepts > 0:
+        structured_logger.info(
+            "timer",
+            "Starting concept extraction phase",
+            pending=pending_concepts,
+        )
+
+        # Get batch of pending chunks (only those with embeddings complete)
+        pending_chunks = get_pending_concept_chunks(limit=200)
+
+        for chunk_data in pending_chunks:
+            # Check if we're running out of time
+            elapsed = time.time() - start_time
+            if elapsed > MAX_RUNTIME_SECONDS:
+                structured_logger.info(
+                    "timer",
+                    "Approaching timeout - stopping concept phase",
+                    elapsed_seconds=elapsed,
+                    concepts_processed=concepts_processed,
+                )
+                break
+
+            try:
+                # Extract concepts from chunk
+                extraction = extract_concepts_from_chunk(chunk_data["text"])
+
+                # Create a Chunk object for store_chunk_extraction
+                chunk = Chunk(
+                    text=chunk_data["text"],
+                    position=0,  # Not needed for extraction
+                )
+                chunk.id = chunk_data["id"]
+
+                # Store extraction results (concepts, mentions, relationships)
+                store_chunk_extraction_standalone(
+                    source_id=chunk_data["source_id"],
+                    chunk=chunk,
+                    extraction=extraction,
+                )
+
+                # Mark chunk as extracted
+                update_chunk_concept_status(chunk_data["id"], "EXTRACTED")
+
+                concepts_processed += 1
+                processed_source_ids.add(chunk_data["source_id"])
+
+                if concepts_processed % 50 == 0:
+                    structured_logger.info(
+                        "timer",
+                        f"Extracted concepts from {concepts_processed} chunks",
+                        concepts_processed=concepts_processed,
+                    )
+
+            except Exception as e:
+                # Mark as failed
+                update_chunk_concept_status(
+                    chunk_data["id"],
+                    "FAILED",
+                    str(e)[:500],
+                )
+                structured_logger.warning(
+                    "timer",
+                    f"Concept extraction failed for chunk {chunk_data['id']}",
+                    error=str(e),
+                )
+
+        structured_logger.info(
+            "timer",
+            "Concept extraction phase complete",
+            concepts_processed=concepts_processed,
+        )
+
+    # === PHASE 3: UPDATE SOURCE STATUS ===
+    # Check if any processed sources are now complete
+    sources_completed = 0
+    for source_id in processed_source_ids:
+        if check_source_complete(source_id):
+            update_source_status(source_id, "COMPLETE")
+            sources_completed += 1
+            structured_logger.info(
+                "timer",
+                "Source processing complete",
+                source_id=source_id,
+            )
+
+    # === FINAL SUMMARY ===
+    elapsed = time.time() - start_time
+    structured_logger.info(
+        "timer",
+        "Timer function complete",
+        elapsed_seconds=round(elapsed, 2),
+        embeddings_processed=embeddings_processed,
+        concepts_processed=concepts_processed,
+        sources_completed=sources_completed,
+    )

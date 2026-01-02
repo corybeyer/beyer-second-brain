@@ -97,19 +97,23 @@ def store_document(
 
             # Serialize embedding if present
             embedding_json = None
+            embedding_status = "PENDING"
             if chunk.embedding is not None:
                 embedding_json = json.dumps(chunk.embedding)
+                embedding_status = "COMPLETE"
 
-            # Store embedding as JSON string (native vector type not available)
-            # Can be converted to vector later when Azure SQL vector support is enabled
+            # Store chunk with processing status
+            # embedding_status: COMPLETE if embedding provided, else PENDING
+            # concept_status: always PENDING (timer function handles extraction)
             cursor.execute(
                 """
                 INSERT INTO chunks (
                     source_id, text, position, page_start, page_end,
-                    section, char_count, embedding, metadata
+                    section, char_count, embedding, embedding_status,
+                    concept_status, metadata
                 )
                 OUTPUT INSERTED.id
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
                 """,
                 (
                     source_id,
@@ -120,6 +124,7 @@ def store_document(
                     chunk.section,
                     len(chunk.text),
                     embedding_json,
+                    embedding_status,
                     chunk_metadata_json,
                 ),
             )
@@ -256,3 +261,213 @@ def get_chunks_for_source(source_id: int) -> list[dict]:
             }
             for row in cursor.fetchall()
         ]
+
+
+def get_pending_embedding_chunks(limit: int = 500) -> list[dict]:
+    """Get chunks that need embeddings generated.
+
+    Args:
+        limit: Maximum number of chunks to return (for batching)
+
+    Returns:
+        List of chunk records with id, source_id, and text
+    """
+    with get_db_cursor(commit=False) as cursor:
+        cursor.execute(
+            """
+            SELECT TOP (?) c.id, c.source_id, c.text, s.file_path
+            FROM chunks c
+            JOIN sources s ON c.source_id = s.id
+            WHERE c.embedding_status = 'PENDING'
+            ORDER BY c.source_id, c.position
+            """,
+            (limit,)
+        )
+        return [
+            {
+                "id": row[0],
+                "source_id": row[1],
+                "text": row[2],
+                "file_path": row[3],
+            }
+            for row in cursor.fetchall()
+        ]
+
+
+def update_chunk_embedding(
+    chunk_id: int,
+    embedding: list[float],
+    status: str = "COMPLETE",
+) -> None:
+    """Update a chunk with its embedding and status.
+
+    Args:
+        chunk_id: ID of chunk to update
+        embedding: Embedding vector (1536 floats)
+        status: New embedding_status value
+    """
+    embedding_json = json.dumps(embedding)
+    with get_db_cursor(commit=True) as cursor:
+        cursor.execute(
+            """
+            UPDATE chunks
+            SET embedding = ?, embedding_status = ?
+            WHERE id = ?
+            """,
+            (embedding_json, status, chunk_id)
+        )
+
+
+def update_chunk_embedding_failed(
+    chunk_id: int,
+    error_message: str,
+) -> None:
+    """Mark a chunk's embedding as failed.
+
+    Args:
+        chunk_id: ID of chunk
+        error_message: Error description
+    """
+    with get_db_cursor(commit=True) as cursor:
+        cursor.execute(
+            """
+            UPDATE chunks
+            SET embedding_status = 'FAILED',
+                extraction_error = ?,
+                extraction_attempts = extraction_attempts + 1
+            WHERE id = ?
+            """,
+            (error_message[:500], chunk_id)  # Truncate to column size
+        )
+
+
+def get_pending_concept_chunks(limit: int = 200) -> list[dict]:
+    """Get chunks that need concept extraction.
+
+    Only returns chunks that have embeddings completed (prerequisite).
+
+    Args:
+        limit: Maximum number of chunks to return (for batching)
+
+    Returns:
+        List of chunk records with id, source_id, and text
+    """
+    with get_db_cursor(commit=False) as cursor:
+        cursor.execute(
+            """
+            SELECT TOP (?) c.id, c.source_id, c.text, s.file_path
+            FROM chunks c
+            JOIN sources s ON c.source_id = s.id
+            WHERE c.embedding_status = 'COMPLETE'
+              AND c.concept_status = 'PENDING'
+              AND c.extraction_attempts < 3
+            ORDER BY c.source_id, c.position
+            """,
+            (limit,)
+        )
+        return [
+            {
+                "id": row[0],
+                "source_id": row[1],
+                "text": row[2],
+                "file_path": row[3],
+            }
+            for row in cursor.fetchall()
+        ]
+
+
+def update_chunk_concept_status(
+    chunk_id: int,
+    status: str,
+    error_message: str | None = None,
+) -> None:
+    """Update a chunk's concept extraction status.
+
+    Args:
+        chunk_id: ID of chunk to update
+        status: New concept_status value ('EXTRACTED' or 'FAILED')
+        error_message: Optional error message for failures
+    """
+    with get_db_cursor(commit=True) as cursor:
+        if error_message:
+            cursor.execute(
+                """
+                UPDATE chunks
+                SET concept_status = ?,
+                    extraction_error = ?,
+                    extraction_attempts = extraction_attempts + 1
+                WHERE id = ?
+                """,
+                (status, error_message[:500], chunk_id)
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE chunks
+                SET concept_status = ?
+                WHERE id = ?
+                """,
+                (status, chunk_id)
+            )
+
+
+def check_source_complete(source_id: int) -> bool:
+    """Check if all chunks for a source have completed processing.
+
+    Args:
+        source_id: ID of source to check
+
+    Returns:
+        True if all chunks have embedding_status='COMPLETE' and concept_status='EXTRACTED'
+    """
+    with get_db_cursor(commit=False) as cursor:
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN embedding_status = 'COMPLETE' THEN 1 ELSE 0 END) as embedded,
+                SUM(CASE WHEN concept_status = 'EXTRACTED' THEN 1 ELSE 0 END) as extracted
+            FROM chunks
+            WHERE source_id = ?
+            """,
+            (source_id,)
+        )
+        row = cursor.fetchone()
+        if row:
+            total, embedded, extracted = row
+            return total > 0 and total == embedded and total == extracted
+        return False
+
+
+def get_processing_stats() -> dict:
+    """Get overall processing statistics.
+
+    Returns:
+        Dict with counts of pending, complete, failed chunks
+    """
+    with get_db_cursor(commit=False) as cursor:
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) as total_chunks,
+                SUM(CASE WHEN embedding_status = 'PENDING' THEN 1 ELSE 0 END) as pending_embeddings,
+                SUM(CASE WHEN embedding_status = 'COMPLETE' THEN 1 ELSE 0 END) as complete_embeddings,
+                SUM(CASE WHEN embedding_status = 'FAILED' THEN 1 ELSE 0 END) as failed_embeddings,
+                SUM(CASE WHEN concept_status = 'PENDING' THEN 1 ELSE 0 END) as pending_concepts,
+                SUM(CASE WHEN concept_status = 'EXTRACTED' THEN 1 ELSE 0 END) as extracted_concepts,
+                SUM(CASE WHEN concept_status = 'FAILED' THEN 1 ELSE 0 END) as failed_concepts
+            FROM chunks
+            """
+        )
+        row = cursor.fetchone()
+        if row:
+            return {
+                "total_chunks": row[0] or 0,
+                "pending_embeddings": row[1] or 0,
+                "complete_embeddings": row[2] or 0,
+                "failed_embeddings": row[3] or 0,
+                "pending_concepts": row[4] or 0,
+                "extracted_concepts": row[5] or 0,
+                "failed_concepts": row[6] or 0,
+            }
+        return {}
