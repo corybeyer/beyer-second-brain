@@ -1,12 +1,20 @@
-# Azure Functions - Blob Trigger for Document Ingestion
+# Azure Functions - Document Ingestion & Processing
 
 ## Overview
 
-This function (`ingest_document`) triggers when a PDF is uploaded to the `documents` container in Azure Blob Storage. It parses the PDF, extracts metadata, and chunks the content for later storage in Azure SQL Graph.
+This function app contains two Azure Functions:
+
+1. **`ingest_document`** (Blob Trigger) - Triggers when a PDF is uploaded to the `documents` container. Parses the PDF, extracts metadata, chunks the content, and stores with PENDING status.
+
+2. **`process_pending_chunks`** (Timer Trigger) - Runs every 5 minutes. Processes pending embeddings and concept extraction in batches. Self-healing: if it times out, the next run continues from where it left off.
 
 ## Architecture
 
+The function app uses **two-phase processing** for reliability with large documents:
+
 ```
+PHASE 1: Blob Trigger (fast, always completes)
+──────────────────────────────────────────────
 Azure Blob Storage (documents container)
         ↓ (blob trigger)
 Azure Function (ingest_document)
@@ -15,30 +23,37 @@ PDF Parser (PyMuPDF/fitz)
         ↓
 Chunker (page-based + size-based)
         ↓
-Embeddings (Azure OpenAI text-embedding-3-small)
+Azure SQL Graph (sources, chunks with PENDING status)
+
+
+PHASE 2: Timer Trigger (self-healing, resumable)
+────────────────────────────────────────────────
+Azure Function (process_pending_chunks) ← runs every 5 minutes
         ↓
-Azure SQL Graph (sources, chunks with JSON embeddings)
+Check for pending work (early exit if none)
         ↓
-Concept Extraction (Azure OpenAI GPT-4o-mini) ← PARALLEL: 20 concurrent workers
+Embeddings (Azure OpenAI text-embedding-3-small, batch of 500)
         ↓
-Azure SQL Graph (concepts, edges)
+Concept Extraction (Azure OpenAI GPT-4o-mini, batch of 200)
+        ↓
+Update chunk status → Mark source COMPLETE when all done
 ```
 
-**Key Design**: Concept extraction uses parallel processing with 20 concurrent API calls. This reduces processing time from ~18 minutes to ~4.5 minutes for a 400+ chunk book.
+**Key Design**: Large documents (800+ pages, 1500+ chunks) would timeout in a single function execution. The timer function processes chunks in batches across multiple invocations—any size document eventually completes.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `function_app.py` | Main entry point, v2 programming model with decorator |
+| `function_app.py` | Two functions: `ingest_document` (blob) + `process_pending_chunks` (timer) |
 | `shared/parser.py` | PDF parsing with PyMuPDF, metadata extraction |
 | `shared/chunker.py` | Text chunking with page boundaries and overlap |
 | `shared/validation.py` | Input validation, cost controls, processing states |
 | `shared/logging_utils.py` | Structured JSON logging with timing |
-| `shared/storage.py` | Database storage with idempotency (delete-and-replace), JSON embeddings |
+| `shared/storage.py` | Database storage, chunk status tracking, batch queries for timer |
 | `shared/embeddings.py` | Azure OpenAI text-embedding-3-small for semantic search |
-| `shared/concepts.py` | Azure OpenAI GPT-4o-mini for concept extraction (was Claude) |
-| `shared/graph.py` | SQL Graph storage with **parallel concept extraction** (ThreadPoolExecutor) |
+| `shared/concepts.py` | Azure OpenAI GPT-4o-mini for concept extraction |
+| `shared/graph.py` | SQL Graph storage (concepts, edges, relationships) |
 | `shared/db/connection.py` | SQL database connection with managed identity |
 | `shared/__init__.py` | Module exports |
 | `requirements.txt` | Python dependencies |
@@ -56,30 +71,42 @@ This function implements patterns from the project's System Behavior spec (see r
 |---------|-------|----------|-------|
 | Max file size | 250 MB | `MAX_FILE_SIZE_BYTES` | Increased for large textbooks |
 | Max pages | 2500 | `MAX_PAGES` | Increased for large textbooks |
-| Max chunks per source | 3000 | `MAX_CHUNKS_PER_SOURCE` | Increased with parallel processing |
+| Max chunks per source | 3000 | `MAX_CHUNKS_PER_SOURCE` | Increased for timer-based processing |
 | Max chunk size | 4000 chars | `MAX_CHUNK_SIZE` | LLM context efficiency |
 | Min text length | 100 chars | `MIN_TEXT_LENGTH` | Catches scanned/empty PDFs |
 | Function timeout | 10 min | `host.json` | Consumption plan maximum |
-| Max concurrent extractions | 20 | `MAX_CONCURRENT_EXTRACTIONS` | Parallel API calls per document |
+| Timer processing cap | 9 min | `MAX_RUNTIME_SECONDS` | Leave 1-min buffer before timeout |
+| Embedding batch size | 500 | `get_pending_embedding_chunks()` | Per timer invocation |
+| Concept batch size | 200 | `get_pending_concept_chunks()` | Per timer invocation |
+| Max extraction retries | 3 | `extraction_attempts < 3` | Before marking chunk FAILED |
 
 ### Processing States
 
+**Source-level states** (document lifecycle):
 ```
-UPLOADED → PARSING → PARSED → EXTRACTING → COMPLETE
-              ↓                    ↓
-           PARSE_FAILED      EXTRACT_FAILED
+UPLOADED → PARSING → PARSED → COMPLETE
+              ↓
+           PARSE_FAILED
 ```
-
 Defined in `shared/validation.py` as `ProcessingStatus` enum.
+
+**Chunk-level states** (processing tracking):
+```
+embedding_status: PENDING → COMPLETE | FAILED
+concept_status:   PENDING → EXTRACTED | FAILED
+```
+- Source moves to COMPLETE when all chunks have `embedding_status=COMPLETE` AND `concept_status=EXTRACTED`
+- Chunks track `extraction_attempts` counter (max 3 retries before marking FAILED)
+- Timer function queries chunks by status to find pending work
 
 ### Validation Pipeline
 
-1. **File size** - Reject files > 100 MB (prevents timeout)
+1. **File size** - Reject files > 250 MB (cost control)
 2. **File type** - Check extension is `.pdf`
 3. **Magic bytes** - Verify file starts with `%PDF-` (security)
-4. **Page count** - Reject documents > 1000 pages (cost control)
+4. **Page count** - Reject documents > 2500 pages (cost control)
 5. **Minimum text** - Reject if < 100 chars extracted (catches scanned PDFs)
-6. **Chunk count** - Reject if > 500 chunks (cost control)
+6. **Chunk count** - Reject if > 3000 chunks (cost control)
 7. **Chunk positions** - Verify sequential positions (invariant)
 8. **Non-empty chunks** - Ensure at least one chunk created (invariant)
 
@@ -164,67 +191,82 @@ ALTER TABLE chunks ALTER COLUMN embedding VECTOR(1536);
 
 ---
 
-## Parallel Processing
+## Timer-Based Processing (Self-Healing)
 
 ### The Problem
 
-A typical book produces 400+ chunks. Sequential API calls for concept extraction:
-- Each call: ~2.5 seconds (Azure OpenAI GPT-4o-mini)
-- 426 chunks × 2.5 sec = ~18 minutes
+A typical book produces 400+ chunks. An 850-page textbook generates 1787 chunks. Even with parallel processing:
 - Azure Functions Consumption plan timeout: 10 minutes maximum
+- Large documents cannot complete in a single function execution
 
-**Result**: Sequential processing causes function timeout for large documents.
+**Result**: Single-function processing times out for very large documents.
 
-### The Solution
+### The Solution: Two-Phase Architecture
 
-Use Python's `ThreadPoolExecutor` to make 20 API calls simultaneously:
+Decouple heavy processing from the blob trigger:
+
+1. **Blob Trigger** (`ingest_document`): Fast path that always completes
+   - Parse PDF, chunk content, store with PENDING status
+   - No API calls, no timeouts for large files
+
+2. **Timer Trigger** (`process_pending_chunks`): Self-healing, resumable
+   - Runs every 5 minutes
+   - Processes chunks in batches (500 embeddings, 200 concepts)
+   - Exits early if no pending work (minimal cost)
+   - If it times out, next run continues from checkpoint
 
 ```python
-# In shared/graph.py
-from concurrent.futures import ThreadPoolExecutor, as_completed
+# In function_app.py
+@app.timer_trigger(schedule="0 */5 * * * *", arg_name="timer")
+def process_pending_chunks(timer: func.TimerRequest) -> None:
+    # 1. Early exit if no work
+    stats = get_processing_stats()
+    if stats["pending_embeddings"] == 0 and stats["pending_concepts"] == 0:
+        return  # Exit immediately, minimal cost
 
-MAX_CONCURRENT_EXTRACTIONS = 20
+    # 2. Process embeddings batch (500 chunks)
+    for chunk in get_pending_embedding_chunks(limit=500):
+        embedding = get_embedding(chunk["text"])
+        update_chunk_embedding(chunk["id"], embedding)
 
-def process_source_concepts(source_id: int, chunks: list["Chunk"]) -> dict:
-    extractions: dict[int, ExtractionResult] = {}
+    # 3. Process concept extraction batch (200 chunks)
+    for chunk in get_pending_concept_chunks(limit=200):
+        extraction = extract_concepts_from_chunk(chunk["text"])
+        store_chunk_extraction_standalone(...)
+        update_chunk_concept_status(chunk["id"], "EXTRACTED")
 
-    def extract_for_chunk(chunk):
-        return chunk.id, extract_concepts_from_chunk(chunk.text)
-
-    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_EXTRACTIONS) as executor:
-        future_to_chunk = {
-            executor.submit(extract_for_chunk, chunk): chunk
-            for chunk in valid_chunks
-        }
-
-        for future in as_completed(future_to_chunk):
-            chunk_id, extraction = future.result()
-            extractions[chunk_id] = extraction
+    # 4. Check if any sources are now complete
+    for source_id in processed_source_ids:
+        if check_source_complete(source_id):
+            update_source_status(source_id, "COMPLETE")
 ```
 
-### Why 20 Workers?
+### Why This Approach?
 
-- Azure OpenAI rate limit: ~1000 requests/minute for this deployment
-- 20 concurrent × 2.5 sec/call = ~480 requests/minute (safely under limit)
-- More workers → risk rate limiting (429 errors)
-- Fewer workers → unnecessarily slow
+- **Self-healing**: If timer times out (9-min cap), next run continues from checkpoint
+- **No size limit**: 1787 chunks? Just takes 4-5 timer invocations
+- **Low idle cost**: Early exit when nothing to process (~100ms check)
+- **Simpler blob trigger**: Parse/chunk/store only, always completes
 
-### Two-Phase Design
+### Batch Sizes
 
-1. **Phase 1 (Parallel)**: Extract concepts from all chunks simultaneously using ThreadPoolExecutor
-2. **Phase 2 (Sequential)**: Store results to database one at a time (DB operations must be sequential for data integrity)
+| Operation | Batch Size | Rationale |
+|-----------|------------|-----------|
+| Embeddings | 500 | Fast (~0.3s each), can process many per run |
+| Concept Extraction | 200 | Slower (~2s each), process fewer to stay under timeout |
 
 ### Performance
 
-| Document | Chunks | Sequential | Parallel | Speedup |
-|----------|--------|------------|----------|---------|
-| 287-page textbook | 426 | ~18 min | ~4.5 min | 4x |
+| Document | Chunks | Timer Invocations | Total Time |
+|----------|--------|-------------------|------------|
+| 287-page book | 426 | ~2 | ~10 min |
+| 850-page book | 1787 | ~5 | ~25 min |
 
 ### Error Handling
 
-- Each worker has its own try/catch
-- Failed extractions are logged but don't stop other workers
-- Stats track both successes and errors
+- Failed chunks marked with `FAILED` status and `extraction_error` message
+- `extraction_attempts` counter tracks retries (max 3)
+- Failures don't stop other chunks from processing
 - Progress logged every 50 chunks
 
 ---
@@ -423,10 +465,19 @@ On Consumption plan, blob trigger uses polling:
 
 ## Testing
 
+### Blob Trigger (ingest_document)
 1. Upload a PDF to `stsecondbrain` → `documents` container
 2. Wait 10-60 seconds for trigger
 3. Check logs in Azure Portal: Function App → Functions → ingest_document → Monitor
 4. Verify output shows: page count, title, author, chunk count
+5. Check database: source created with status=PARSED, chunks have embedding_status=PENDING
+
+### Timer Trigger (process_pending_chunks)
+1. Wait up to 5 minutes for next timer invocation
+2. Check logs in Azure Portal: Function App → Functions → process_pending_chunks → Monitor
+3. Verify output shows: embeddings_processed, concepts_processed, sources_completed
+4. Check database: chunks should have embedding_status=COMPLETE, concept_status=EXTRACTED
+5. Source should have status=COMPLETE when all chunks are done
 
 ---
 
