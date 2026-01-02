@@ -15,14 +15,16 @@ PDF Parser (PyMuPDF/fitz)
         ↓
 Chunker (page-based + size-based)
         ↓
-Embeddings (OpenAI/Azure AI)
+Embeddings (Azure OpenAI text-embedding-3-small)
         ↓
-Azure SQL Graph (sources, chunks)
+Azure SQL Graph (sources, chunks with JSON embeddings)
         ↓
-Concept Extraction (Claude API)
+Concept Extraction (Azure OpenAI GPT-4o-mini) ← PARALLEL: 20 concurrent workers
         ↓
 Azure SQL Graph (concepts, edges)
 ```
+
+**Key Design**: Concept extraction uses parallel processing with 20 concurrent API calls. This reduces processing time from ~18 minutes to ~4.5 minutes for a 400+ chunk book.
 
 ## Files
 
@@ -33,13 +35,14 @@ Azure SQL Graph (concepts, edges)
 | `shared/chunker.py` | Text chunking with page boundaries and overlap |
 | `shared/validation.py` | Input validation, cost controls, processing states |
 | `shared/logging_utils.py` | Structured JSON logging with timing |
-| `shared/storage.py` | Database storage with idempotency (delete-and-replace) |
-| `shared/embeddings.py` | OpenAI/Azure AI embeddings for semantic search |
-| `shared/concepts.py` | Claude API for concept extraction |
-| `shared/graph.py` | SQL Graph storage for concepts and relationships |
+| `shared/storage.py` | Database storage with idempotency (delete-and-replace), JSON embeddings |
+| `shared/embeddings.py` | Azure OpenAI text-embedding-3-small for semantic search |
+| `shared/concepts.py` | Azure OpenAI GPT-4o-mini for concept extraction (was Claude) |
+| `shared/graph.py` | SQL Graph storage with **parallel concept extraction** (ThreadPoolExecutor) |
+| `shared/db/connection.py` | SQL database connection with managed identity |
 | `shared/__init__.py` | Module exports |
 | `requirements.txt` | Python dependencies |
-| `host.json` | Azure Functions host configuration |
+| `host.json` | Azure Functions host configuration (10-minute timeout) |
 
 ---
 
@@ -49,13 +52,15 @@ This function implements patterns from the project's System Behavior spec (see r
 
 ### Cost Controls
 
-| Control | Limit | Constant |
-|---------|-------|----------|
-| Max file size | 100 MB | `MAX_FILE_SIZE_BYTES` |
-| Max pages | 1000 | `MAX_PAGES` |
-| Max chunks per source | 500 | `MAX_CHUNKS_PER_SOURCE` |
-| Max chunk size | 4000 chars | `MAX_CHUNK_SIZE` |
-| Min text length | 100 chars | `MIN_TEXT_LENGTH` |
+| Control | Limit | Constant | Notes |
+|---------|-------|----------|-------|
+| Max file size | 250 MB | `MAX_FILE_SIZE_BYTES` | Increased for large textbooks |
+| Max pages | 2500 | `MAX_PAGES` | Increased for large textbooks |
+| Max chunks per source | 3000 | `MAX_CHUNKS_PER_SOURCE` | Increased with parallel processing |
+| Max chunk size | 4000 chars | `MAX_CHUNK_SIZE` | LLM context efficiency |
+| Min text length | 100 chars | `MIN_TEXT_LENGTH` | Catches scanned/empty PDFs |
+| Function timeout | 10 min | `host.json` | Consumption plan maximum |
+| Max concurrent extractions | 20 | `MAX_CONCURRENT_EXTRACTIONS` | Parallel API calls per document |
 
 ### Processing States
 
@@ -120,6 +125,110 @@ Implemented in `shared/storage.py` using delete-and-replace pattern:
 
 ---
 
+## Embedding Storage
+
+### Why JSON Instead of VECTOR?
+
+Azure SQL has a native `VECTOR(1536)` type for storing embeddings, but it's not available on the Basic tier. Instead, embeddings are stored as JSON strings in `NVARCHAR(MAX)`.
+
+**Storage approach** (in `shared/storage.py`):
+```python
+# Convert embedding list to JSON string
+embedding_json = json.dumps(chunk.embedding) if chunk.embedding else None
+
+# Store in chunks table
+cursor.execute(
+    """INSERT INTO chunks (..., embedding, ...) VALUES (..., ?, ...)""",
+    (..., embedding_json, ...)
+)
+```
+
+**Retrieval** (for future Streamlit app):
+```python
+# Load embedding from JSON
+embedding = json.loads(row["embedding"]) if row["embedding"] else None
+```
+
+**Trade-offs**:
+- ❌ No native `VECTOR_DISTANCE()` function for similarity search
+- ❌ Larger storage size (JSON overhead)
+- ✅ Works on Basic tier ($5/month)
+- ✅ Can migrate to VECTOR type later if needed
+- ✅ Easy to debug (human-readable)
+
+**Future migration**: If Azure SQL VECTOR functions become available on Basic tier, run:
+```sql
+ALTER TABLE chunks ALTER COLUMN embedding VECTOR(1536);
+-- Then update Python code to use VECTOR casting
+```
+
+---
+
+## Parallel Processing
+
+### The Problem
+
+A typical book produces 400+ chunks. Sequential API calls for concept extraction:
+- Each call: ~2.5 seconds (Azure OpenAI GPT-4o-mini)
+- 426 chunks × 2.5 sec = ~18 minutes
+- Azure Functions Consumption plan timeout: 10 minutes maximum
+
+**Result**: Sequential processing causes function timeout for large documents.
+
+### The Solution
+
+Use Python's `ThreadPoolExecutor` to make 20 API calls simultaneously:
+
+```python
+# In shared/graph.py
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+MAX_CONCURRENT_EXTRACTIONS = 20
+
+def process_source_concepts(source_id: int, chunks: list["Chunk"]) -> dict:
+    extractions: dict[int, ExtractionResult] = {}
+
+    def extract_for_chunk(chunk):
+        return chunk.id, extract_concepts_from_chunk(chunk.text)
+
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_EXTRACTIONS) as executor:
+        future_to_chunk = {
+            executor.submit(extract_for_chunk, chunk): chunk
+            for chunk in valid_chunks
+        }
+
+        for future in as_completed(future_to_chunk):
+            chunk_id, extraction = future.result()
+            extractions[chunk_id] = extraction
+```
+
+### Why 20 Workers?
+
+- Azure OpenAI rate limit: ~1000 requests/minute for this deployment
+- 20 concurrent × 2.5 sec/call = ~480 requests/minute (safely under limit)
+- More workers → risk rate limiting (429 errors)
+- Fewer workers → unnecessarily slow
+
+### Two-Phase Design
+
+1. **Phase 1 (Parallel)**: Extract concepts from all chunks simultaneously using ThreadPoolExecutor
+2. **Phase 2 (Sequential)**: Store results to database one at a time (DB operations must be sequential for data integrity)
+
+### Performance
+
+| Document | Chunks | Sequential | Parallel | Speedup |
+|----------|--------|------------|----------|---------|
+| 287-page textbook | 426 | ~18 min | ~4.5 min | 4x |
+
+### Error Handling
+
+- Each worker has its own try/catch
+- Failed extractions are logged but don't stop other workers
+- Stats track both successes and errors
+- Progress logged every 50 chunks
+
+---
+
 ## Deployment
 
 ### Required Azure App Settings
@@ -132,6 +241,13 @@ These must be configured in `func-secondbrain` → Environment variables:
 | `FUNCTIONS_EXTENSION_VERSION` | `~4` | Functions runtime version |
 | `AzureWebJobsStorage` | Connection string to storage account | Blob trigger connection |
 | `AzureWebJobsFeatureFlags` | `EnableWorkerIndexing` | **Required for v2 programming model** |
+| `AZURE_OPENAI_ENDPOINT` | Azure AI Foundry endpoint URL | For embeddings and concept extraction |
+| `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` | `text-embedding-3-small` | Deployment name for embeddings |
+| `AZURE_OPENAI_COMPLETION_DEPLOYMENT` | `gpt-4o-mini` | Deployment name for concept extraction |
+| `SQL_SERVER` | Your SQL server FQDN | Database connection |
+| `SQL_DATABASE` | `secondbrain` | Database name |
+
+**Note**: Azure OpenAI uses managed identity authentication (DefaultAzureCredential). No API keys needed if Function App has "Cognitive Services OpenAI User" role on the Azure OpenAI resource.
 
 ### GitHub Actions Workflow
 
@@ -259,6 +375,24 @@ az functionapp restart \
 )
 def ingest_document(blob: func.InputStream) -> None:
     ...
+```
+
+### Azure OpenAI with Managed Identity
+
+Both embeddings and concept extraction use Azure OpenAI with managed identity (no API keys):
+
+```python
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+
+token_provider = get_bearer_token_provider(
+    DefaultAzureCredential(),
+    "https://cognitiveservices.azure.com/.default"
+)
+client = AzureOpenAI(
+    azure_endpoint=endpoint,
+    azure_ad_token_provider=token_provider,
+    api_version="2024-02-01",
+)
 ```
 
 ### Dependency Packaging
