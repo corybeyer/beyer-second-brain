@@ -99,9 +99,29 @@ cp .env.example .env
 # Initialize database (requires ODBC driver)
 python scripts/init_db.py
 
+# For existing databases, run migration to add chunk status columns
+python scripts/init_db.py --migrate
+
 # Test connectivity
 python scripts/test_connectivity.py
 ```
+
+### Database Migration
+
+If upgrading from an earlier version, run the migration to add chunk processing status columns:
+
+```bash
+python scripts/init_db.py --migrate
+```
+
+Or manually in Azure Portal → SQL Database → Query editor:
+
+```sql
+ALTER TABLE chunks ADD extraction_attempts INT NOT NULL DEFAULT 0;
+ALTER TABLE chunks ADD extraction_error NVARCHAR(500) NULL;
+```
+
+These columns enable the timer function's retry tracking for failed chunks.
 
 ## Cost
 
