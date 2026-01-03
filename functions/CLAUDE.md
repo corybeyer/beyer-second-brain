@@ -191,6 +191,55 @@ ALTER TABLE chunks ALTER COLUMN embedding VECTOR(1536);
 
 ---
 
+## Database Schema Migration
+
+The timer function requires chunk-level status tracking columns. If your database was created before the two-phase architecture, run the migration.
+
+### Required Columns
+
+| Column | Type | Purpose |
+|--------|------|---------|
+| `embedding_status` | NVARCHAR(20) | PENDING, COMPLETE, FAILED |
+| `concept_status` | NVARCHAR(20) | PENDING, EXTRACTED, FAILED |
+| `extraction_attempts` | INT | Retry counter (max 3) |
+| `extraction_error` | NVARCHAR(500) | Last error message |
+
+### Migration Options
+
+**Option 1: Use init_db.py** (recommended for local dev):
+```bash
+python scripts/init_db.py --migrate
+```
+
+**Option 2: Manual SQL** (Azure Portal → Query editor):
+```sql
+-- Add columns for retry tracking
+ALTER TABLE chunks ADD extraction_attempts INT NOT NULL DEFAULT 0;
+ALTER TABLE chunks ADD extraction_error NVARCHAR(500) NULL;
+
+-- Add indexes for timer function queries
+CREATE INDEX IX_chunks_embedding_status ON chunks(embedding_status);
+CREATE INDEX IX_chunks_concept_status ON chunks(concept_status);
+```
+
+**Option 3: Fix existing data** (if concepts already extracted):
+```sql
+-- Mark already-processed chunks as complete
+UPDATE chunks SET concept_status = 'EXTRACTED' WHERE concept_status = 'PENDING';
+UPDATE sources SET status = 'COMPLETE' WHERE status = 'PARSED';
+```
+
+### Symptom of Missing Columns
+
+Timer function fails with:
+```
+Invalid column name 'extraction_attempts'
+```
+
+This means the migration hasn't been run. Add the columns and the timer will resume.
+
+---
+
 ## Timer-Based Processing (Self-Healing)
 
 ### The Problem
